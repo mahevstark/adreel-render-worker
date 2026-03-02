@@ -10,11 +10,13 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Build context = repo root, so reference worker/ prefix
+# Build context = repo root; Dockerfile lives in worker/ but Railway context is repo root
 COPY worker/requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY worker/ .
 
 EXPOSE 8000
-CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+
+# Use $PORT env var injected by Railway; fall back to 8000 for local dev
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1"]

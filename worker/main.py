@@ -25,6 +25,7 @@ import edge_tts
 import httpx
 import numpy as np
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from moviepy.editor import (
     AudioFileClip, ColorClip, VideoFileClip, concatenate_videoclips,
 )
@@ -32,9 +33,19 @@ from PIL import Image  # noqa: F401 (keep Pillow import for future use)
 
 app = FastAPI(title="AdReel Render Worker")
 
+# ── CORS — allow Vercel frontend + any server-to-server calls ─────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],          # Vercel origin set at infra level; worker is server-to-server
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    allow_credentials=False,
+)
+
+# ── Health check — Railway uses this to mark deployment "Healthy" ─────────────
 @app.get("/health")
 async def health():
-    return {"status": "ok", "worker": "adreel-render-worker"}
+    return {"ok": True, "status": "ok", "worker": "adreel-render-worker"}
 
 WORKER_SECRET = os.environ.get("RENDER_WORKER_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
@@ -56,9 +67,12 @@ VOICE_MAP = {
 }
 
 
-def verify_secret(x_worker_secret: str = Header("")):
+def verify_secret(x_worker_secret: str = Header(default="")):
     if WORKER_SECRET and x_worker_secret != WORKER_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+        raise HTTPException(
+            status_code=401,
+            detail={"ok": False, "error": "Unauthorized — invalid worker secret"},
+        )
 
 
 @app.post("/render/start")
