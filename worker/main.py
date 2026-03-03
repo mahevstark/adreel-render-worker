@@ -20,7 +20,6 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-import boto3
 import edge_tts
 import httpx
 import numpy as np
@@ -49,11 +48,9 @@ async def health():
 
 WORKER_SECRET = os.environ.get("RENDER_WORKER_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
-R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "")
-R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
-R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
-R2_BUCKET = os.environ.get("R2_BUCKET", "adreel-renders")
-R2_PUBLIC_URL = os.environ.get("R2_PUBLIC_URL", "")
+CLOUDINARY_CLOUD = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
+CLOUDINARY_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
+CLOUDINARY_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
 
 jobs: dict = {}
 
@@ -137,13 +134,11 @@ async def run_render(job_id: str, plan: dict):
                           plan.get("caption_style", "bold"), str(final_path))
 
             update("UPLOADING", 90)
-            key = f"renders/{job_id}/reel.mp4"
-            thumb_key = f"renders/{job_id}/thumb.jpg"
-            video_url = upload_to_r2(str(final_path), key)
+            video_url = upload_to_cloudinary(str(final_path), "video")
 
             thumb_path = tmp / "thumb.jpg"
             extract_thumbnail(str(final_path), str(thumb_path))
-            thumb_url = upload_to_r2(str(thumb_path), thumb_key)
+            thumb_url = upload_to_cloudinary(str(thumb_path), "image")
 
             file_size = os.path.getsize(str(final_path))
             update("DONE", 100, video_url=video_url, thumbnail_url=thumb_url,
@@ -278,17 +273,31 @@ def burn_captions(video_path: str, captions: list, style: str, out_path: str):
     )
 
 
-# ─── R2 Upload ────────────────────────────────────────────────────────────────
-def upload_to_r2(file_path: str, key: str) -> str:
-    if not R2_ENDPOINT:
+# ─── Cloudinary Upload ────────────────────────────────────────────────────────
+def upload_to_cloudinary(file_path: str, resource_type: str = "video") -> str:
+    """Upload file to Cloudinary and return the secure URL."""
+    if not CLOUDINARY_CLOUD:
         return f"file://{file_path}"
-    s3 = boto3.client("s3", endpoint_url=R2_ENDPOINT,
-                      aws_access_key_id=R2_ACCESS_KEY,
-                      aws_secret_access_key=R2_SECRET_KEY, region_name="auto")
-    content_type = "video/mp4" if key.endswith(".mp4") else "image/jpeg"
-    s3.upload_file(file_path, R2_BUCKET, key,
-                   ExtraArgs={"ContentType": content_type, "ACL": "public-read"})
-    return f"{R2_PUBLIC_URL}/{key}"
+    import hashlib, hmac, time as _time
+    timestamp = int(_time.time())
+    folder = "adreel-renders"
+    params_to_sign = f"folder={folder}&timestamp={timestamp}{CLOUDINARY_SECRET}"
+    signature = hashlib.sha1(params_to_sign.encode()).hexdigest()
+    url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    with open(file_path, "rb") as f:
+        import urllib.request, urllib.parse
+        # Use httpx synchronously for the upload
+        import httpx as _httpx
+        data = {
+            "api_key": CLOUDINARY_KEY,
+            "timestamp": str(timestamp),
+            "folder": folder,
+            "signature": signature,
+        }
+        files = {"file": f.read()}
+        resp = _httpx.post(url, data=data, files={"file": (os.path.basename(file_path), files["file"])}, timeout=120)
+        resp.raise_for_status()
+        return resp.json()["secure_url"]
 
 
 def extract_thumbnail(video_path: str, out_path: str):
