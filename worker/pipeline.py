@@ -13,6 +13,7 @@ from ffmpeg_utils import (
     compose_xfade, mix_audio_sync, burn_captions,
     build_word_captions, extract_thumbnail,
 )
+from scenes_templates import make_scene, SCENE_PALETTES
 
 # ── Semantic scene → keyword map ──────────────────────────────────────────────
 SCENE_KWMAP: dict[str, list[str]] = {
@@ -40,6 +41,16 @@ CLOUDINARY_KEY    = os.environ.get("CLOUDINARY_API_KEY", "")
 CLOUDINARY_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
 
 _used_ids: set = set()   # dedup Pexels clip IDs per render
+
+# ── Sentence-segmented TTS with natural pauses ───────────────────────────────
+def segment_narration(text: str) -> str:
+    """Insert natural pauses between sentences for edge-tts (SSML-style spacing)."""
+    import re
+    # Add double-space pause between sentences (edge-tts respects punctuation pauses)
+    text = re.sub(r'([.!?])\s+', r'\1  ', text.strip())
+    # Add slight pause after commas
+    text = re.sub(r',\s+', r',  ', text)
+    return text
 
 
 # ── Plan normalizer: enforce 6 scenes × 10s ──────────────────────────────────
@@ -204,22 +215,34 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
             voice     = VOICE_MAP.get(plan.get("voice_style", "professional_female"),
                                       "en-US-JennyNeural")
             audio_pth = tmp / "voice.mp3"
+            narr_text_paced = segment_narration(narr_text)
             await asyncio.wait_for(
-                generate_tts(narr_text, voice, str(audio_pth)), timeout=90
+                generate_tts(narr_text_paced, voice, str(audio_pth)), timeout=90
             )
 
-            # 2 — Fetch + process clips (trim + grade + motion)
+            # 2 — Build scene visuals: Pexels clip OR motion-graphic template
             u("FETCHING_ASSETS", 15)
             clips: list[str] = []
+
+            # Extract per-scene headline from narration text
+            narr_words   = narr_text.split()
+            words_per_sc = max(1, len(narr_words) // 6)
+            sc_headlines = [
+                " ".join(narr_words[i * words_per_sc:(i + 1) * words_per_sc])[:50]
+                for i in range(6)
+            ]
+
             async with httpx.AsyncClient(timeout=30) as client:
                 for i, scene in enumerate(scenes):
-                    stype = scene.get("scene_type", SCENE_ORDER[i % len(SCENE_ORDER)])
-                    kws   = (
+                    stype    = scene.get("scene_type", SCENE_ORDER[i % len(SCENE_ORDER)])
+                    kws      = (
                         scene.get("search_keywords")
                         or random.choice(SCENE_KWMAP.get(stype, [["lifestyle"]])).split()
                     )
                     raw  = tmp / f"raw_{i}.mp4"
                     proc = str(tmp / f"proc_{i}.mp4")
+
+                    # Try Pexels first
                     clip = await fetch_pexels(client, kws, 10.0, raw)
                     if clip and clip.exists():
                         try:
@@ -229,9 +252,12 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
                             continue
                         except Exception:
                             pass
-                    # Fallback: animated dark card
-                    overlay = scene.get("overlay_text") or scene.get("on_screen_text") or []
-                    clips.append(make_color_card(tmp, i, 10.0, overlay_text=overlay))
+
+                    # Fallback: motion-graphic template (better than color card)
+                    headline = sc_headlines[i] if i < len(sc_headlines) else ""
+                    subline  = stype.replace("_", " ").title()
+                    mg_path  = make_scene(tmp, i, stype, 10.0, headline=headline, subline=subline)
+                    clips.append(mg_path)
                     u("FETCHING_ASSETS", 15 + i * 5)
 
             # 3 — Compose with xfade transitions
