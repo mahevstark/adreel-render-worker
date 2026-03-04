@@ -164,57 +164,82 @@ def compose_xfade(clips: list, out_path: str, xfade_dur: float = 0.4):
     subprocess.run(args, check=True, capture_output=True)
 
 
-# ── Audio mix: loop video to audio length ────────────────────────────────────
+# ── Audio mix: pad audio to video length (never cut the video short) ─────────
 def mix_audio_sync(video_path: str, audio_path: str, out_path: str):
-    if not os.path.exists(audio_path):
-        shutil.copy(video_path, out_path)
-        return
-    audio_dur = get_duration(audio_path)
+    """Mux audio into video. Pads audio with silence if shorter than video."""
     video_dur = get_duration(video_path)
-    if audio_dur <= 0:
+    if not os.path.exists(audio_path) or video_dur <= 0:
         shutil.copy(video_path, out_path)
         return
-    loops = max(1, int(audio_dur / max(video_dur, 0.1)) + 1)
+    # Pad audio with silence to reach video duration, then mux
     subprocess.run([
         "ffmpeg", "-y",
-        "-stream_loop", str(loops - 1), "-i", video_path,
+        "-i", video_path,
         "-i", audio_path,
-        "-t", str(audio_dur),
-        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-filter_complex",
+        f"[1:a]apad=whole_dur={video_dur:.3f}[apadded]",
+        "-map", "0:v",
+        "-map", "[apadded]",
+        "-t", str(video_dur),
+        "-c:v", "copy",
         "-c:a", "aac", "-b:a", "192k",
         out_path,
     ], check=True, capture_output=True)
 
 
-# ── Captions with fade-in/out ─────────────────────────────────────────────────
+# ── Word-by-word caption timing ───────────────────────────────────────────────
+def build_word_captions(full_text: str, video_dur: float) -> list:
+    """Split text into 2–4 word chunks, evenly timed across video_dur."""
+    words = full_text.split()
+    if not words:
+        return []
+    chunk_size  = 3                            # words per caption card
+    chunks      = [words[i:i+chunk_size] for i in range(0, len(words), chunk_size)]
+    dur_each    = video_dur / max(len(chunks), 1)
+    captions    = []
+    for i, chunk in enumerate(chunks):
+        s = round(i * dur_each, 3)
+        e = round(s + dur_each - 0.08, 3)     # 80ms gap between cards
+        captions.append({"text": " ".join(chunk), "start_s": s, "end_s": e})
+    return captions
+
+
+# ── Burn captions: large bold word-by-word style ──────────────────────────────
 def burn_captions(video_path: str, captions: list, style: str, out_path: str):
     if not captions:
         shutil.copy(video_path, out_path)
         return
 
-    sz  = {"bold": 68, "punchy": 76, "minimal": 52}.get(style, 68)
+    sz  = {"bold": 72, "punchy": 82, "minimal": 54}.get(style, 72)
     col = {"bold": "white", "punchy": "yellow", "minimal": "white"}.get(style, "white")
-    bw  = {"bold": 5, "punchy": 4, "minimal": 2}.get(style, 4)
+    bw  = {"bold": 5, "punchy": 4, "minimal": 2}.get(style, 5)
 
     vf_parts = []
     for cap in captions:
-        s  = float(cap.get("start_s", 0))
-        e  = float(cap.get("end_s", s + 2))
-        t  = safe_text(cap.get("text", ""))
+        s = float(cap.get("start_s", 0))
+        e = float(cap.get("end_s",   s + 1.5))
+        t = safe_text(cap.get("text", ""))
         if not t:
             continue
-        fi = s + 0.3      # fade-in end
-        fo = e - 0.25     # fade-out start
+        # Fade-in 0.12s, hold, fade-out 0.10s
+        fi = round(s + 0.12, 3)
+        fo = round(e - 0.10, 3)
         alpha = (
             f"if(lt(t,{s:.3f}),0,"
-            f"if(lt(t,{fi:.3f}),(t-{s:.3f})/0.3,"
+            f"if(lt(t,{fi:.3f}),(t-{s:.3f})/0.12,"
             f"if(lt(t,{fo:.3f}),1,"
-            f"if(lt(t,{e:.3f}),({e:.3f}-t)/0.25,0))))"
+            f"if(lt(t,{e:.3f}),({e:.3f}-t)/0.10,0))))"
+        )
+        # Shadow layer (offset 3px) + main text for depth
+        vf_parts.append(
+            f"drawtext=text='{t}':fontsize={sz}:fontcolor=black@0.6"
+            f":borderw=0:x=(w-text_w)/2+3:y=h*0.84-text_h/2+3"
+            f":enable='between(t,{s:.3f},{e:.3f})':alpha='{alpha}'"
         )
         vf_parts.append(
             f"drawtext=text='{t}':fontsize={sz}:fontcolor={col}"
             f":bordercolor=black:borderw={bw}"
-            f":x=(w-text_w)/2:y=h*0.82-text_h/2"
+            f":x=(w-text_w)/2:y=h*0.84-text_h/2"
             f":enable='between(t,{s:.3f},{e:.3f})':alpha='{alpha}'"
         )
 

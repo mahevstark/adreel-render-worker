@@ -10,7 +10,8 @@ import httpx
 
 from ffmpeg_utils import (
     get_duration, trim_and_grade, make_color_card,
-    compose_xfade, mix_audio_sync, burn_captions, extract_thumbnail,
+    compose_xfade, mix_audio_sync, burn_captions,
+    build_word_captions, extract_thumbnail,
 )
 
 # ── Semantic scene → keyword map ──────────────────────────────────────────────
@@ -190,13 +191,15 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
             plan   = normalize_plan(plan)
             scenes = plan["scenes"]
 
-            # 1 — TTS: full narration as one track
+            # 1 — TTS: prefer full voiceover_script for long audio
             u("GENERATING_AUDIO", 5)
-            narr_text = " ".join(s.get("_caption", "") for s in scenes).strip()
-            if not narr_text:
-                narr_text = " ".join(
-                    n.get("text", "") for n in plan.get("narration", [])
-                ).strip() or "Discover something amazing today."
+            # Priority: voiceover_script (full ad copy) > narration segments > captions
+            narr_text = (
+                plan.get("voiceover_script", "").strip()
+                or " ".join(n.get("text", "") for n in plan.get("narration", [])).strip()
+                or " ".join(s.get("_caption", "") for s in scenes).strip()
+                or "Discover something amazing today."
+            )
 
             voice     = VOICE_MAP.get(plan.get("voice_style", "professional_female"),
                                       "en-US-JennyNeural")
@@ -241,17 +244,11 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
             with_audio = tmp / "with_audio.mp4"
             mix_audio_sync(str(composed), str(audio_pth), str(with_audio))
 
-            # 5 — Burn captions with fade animation
+            # 5 — Word-by-word captions timed across full video
             u("COMPOSITING", 82)
-            final = tmp / "final.mp4"
-            captions = [
-                {
-                    "text":    s["_caption"],
-                    "start_s": s["_cap_start"],
-                    "end_s":   s["_cap_end"],
-                }
-                for s in scenes if s.get("_caption", "").strip()
-            ]
+            final    = tmp / "final.mp4"
+            vid_dur  = get_duration(str(with_audio))
+            captions = build_word_captions(narr_text, vid_dur)
             burn_captions(str(with_audio), captions, plan.get("caption_style", "bold"), str(final))
 
             # 6 — Upload
