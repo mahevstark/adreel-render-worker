@@ -16,8 +16,8 @@ GRADE_VF = (
 TRANSITION_STYLES = ["fade", "slideleft", "slideup", "fadeblack", "wipeleft"]
 MOTION_TYPES      = ["zoom_in", "zoom_out", "pan_right", "zoom_in", "zoom_out", "pan_left"]
 
-# Set FAST_MOTION=1 on Railway to skip zoompan (saves ~2min render time)
-FAST_MOTION = os.environ.get("FAST_MOTION", "0") == "1"
+# Zoompan is CPU-intensive — default OFF on Railway (set CINEMATIC_MOTION=1 to enable)
+FAST_MOTION = os.environ.get("CINEMATIC_MOTION", "0") != "1"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
