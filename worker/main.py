@@ -291,25 +291,26 @@ def make_color_card(tmp: Path, index: int, duration: float,
                     color: str = "0x1a1a2e", overlay_text: list | None = None) -> str:
     """Generate an animated gradient card MP4 with optional text overlay."""
     out = str(tmp / f"card_{index}.mp4")
-    # Animated purple-blue gradient via geq (no external assets needed)
+
+    # Use nullsrc as input; geq + format in -vf (separate from -i)
     geq = (
         "geq="
         "r='30+20*sin(2*PI*X/1080+t*0.4)':"
         "g='10+5*cos(2*PI*Y/1920+t*0.3)':"
         "b='120+80*sin(2*PI*(X+Y)/1200+t*0.6)'"
     )
-    vf = f"nullsrc=size=1080x1920:rate=30,{geq},format=yuv420p"
+    vf_parts = [geq, "format=yuv420p"]
 
-    # Add text overlays if provided
+    # Add text overlays via drawtext (in -vf, NOT in -i)
     if overlay_text:
         for line_idx, line in enumerate(overlay_text[:4]):
             safe = (str(line)
                     .replace("\\", "\\\\")
                     .replace("'", "\u2019")
                     .replace(":", "\\:"))
-            y_pos = 760 + line_idx * 110  # centre of frame
-            vf += (
-                f",drawtext=text='{safe}'"
+            y_pos = 760 + line_idx * 110
+            vf_parts.append(
+                f"drawtext=text='{safe}'"
                 f":fontsize=72:fontcolor=white"
                 f":bordercolor=black:borderw=4"
                 f":x=(w-text_w)/2:y={y_pos}"
@@ -317,7 +318,9 @@ def make_color_card(tmp: Path, index: int, duration: float,
 
     subprocess.run([
         "ffmpeg", "-y",
-        "-f", "lavfi", "-i", vf,
+        "-f", "lavfi",
+        "-i", "nullsrc=size=1080x1920:rate=30",
+        "-vf", ",".join(vf_parts),
         "-t", str(duration),
         "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
         out,
