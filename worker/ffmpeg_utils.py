@@ -6,11 +6,11 @@ import os, re, shutil, subprocess
 from pathlib import Path
 
 # ── Cinematic LUT (applied to every clip for consistent look) ─────────────────
-# Warm-film grade: slight lift in shadows, push blue/teal in highlights
+# eq only — avoids single-quote conflicts with drawtext in same -vf chain
+# vignette uses numeric angle (PI/4.5 ≈ 0.698) to avoid PI parsing issues
 GRADE_VF = (
-    "eq=brightness=0.02:saturation=1.22:contrast=1.10:gamma=1.04,"
-    "curves=r='0/0 0.5/0.47 1/0.93':g='0/0 0.5/0.50 1/1.00':b='0/0 0.5/0.53 1/1.06',"
-    "vignette=PI/4.5"
+    "eq=brightness=0.02:saturation=1.22:contrast=1.10:gamma=1.04:gamma_r=1.05:gamma_b=0.96,"
+    "vignette=0.698"
 )
 
 TRANSITION_STYLES = ["fade", "slideleft", "slideup", "fadeblack", "wipeleft"]
