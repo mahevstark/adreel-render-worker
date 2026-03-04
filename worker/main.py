@@ -172,7 +172,7 @@ async def run_render(job_id: str, plan: dict):
                 timeout=60,
             )
 
-            # Measure TTS audio duration — scale scenes to match
+            # Measure TTS audio duration — scale scenes to match, min 3s each
             audio_dur = get_audio_duration(str(audio_path))
             if audio_dur > 0:
                 scenes = plan.get("scenes", [])
@@ -182,7 +182,7 @@ async def run_render(job_id: str, plan: dict):
                 if abs(total_scene_dur - audio_dur) > 2:
                     scale = audio_dur / total_scene_dur
                     for s in scenes:
-                        s["duration_s"] = float(s.get("duration_s", 5)) * scale
+                        s["duration_s"] = max(3.0, float(s.get("duration_s", 5)) * scale)
                 plan["duration_s"] = audio_dur
 
             # 2. Download B-roll clips
@@ -287,28 +287,29 @@ def get_audio_duration(path: str) -> float:
         return 0.0
 
 
+def _safe_drawtext(raw: str) -> str:
+    """Strip markdown and escape special chars for FFmpeg drawtext."""
+    import re
+    text = re.sub(r'\*+|_+|`+', '', str(raw))  # strip **, *, _, ``
+    text = text.replace("\\", "\\\\").replace("'", "\u2019").replace(":", "\\:")
+    return text
+
+
 def make_color_card(tmp: Path, index: int, duration: float,
                     color: str = "0x1a1a2e", overlay_text: list | None = None) -> str:
-    """Generate an animated gradient card MP4 with optional text overlay."""
+    """Generate a styled dark card MP4 with optional text overlay."""
     out = str(tmp / f"card_{index}.mp4")
+    # Enforce minimum duration so libx264 has enough frames
+    duration = max(duration, 1.5)
 
-    # Use nullsrc as input; geq + format in -vf (separate from -i)
-    geq = (
-        "geq="
-        "r='30+20*sin(2*PI*X/1080+t*0.4)':"
-        "g='10+5*cos(2*PI*Y/1920+t*0.3)':"
-        "b='120+80*sin(2*PI*(X+Y)/1200+t*0.6)'"
-    )
-    vf_parts = [geq, "format=yuv420p"]
-
-    # Add text overlays via drawtext (in -vf, NOT in -i)
+    # Simple color source — reliable on all FFmpeg builds
+    vf_parts = ["format=yuv420p"]
     if overlay_text:
         for line_idx, line in enumerate(overlay_text[:4]):
-            safe = (str(line)
-                    .replace("\\", "\\\\")
-                    .replace("'", "\u2019")
-                    .replace(":", "\\:"))
-            y_pos = 760 + line_idx * 110
+            safe = _safe_drawtext(line)
+            if not safe.strip():
+                continue
+            y_pos = 760 + line_idx * 120
             vf_parts.append(
                 f"drawtext=text='{safe}'"
                 f":fontsize=72:fontcolor=white"
@@ -319,7 +320,7 @@ def make_color_card(tmp: Path, index: int, duration: float,
     subprocess.run([
         "ffmpeg", "-y",
         "-f", "lavfi",
-        "-i", "nullsrc=size=1080x1920:rate=30",
+        "-i", "color=c=#1a1a2e:size=1080x1920:rate=30",
         "-vf", ",".join(vf_parts),
         "-t", str(duration),
         "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
