@@ -18,6 +18,16 @@ SCENE_PALETTES = {
 
 W, H, FPS = 1080, 1920, 25
 
+# Simple solid bg colors per scene (no geq — avoids single-quote conflicts)
+SCENE_BG_COLORS = {
+    "hook":         "#0d0020",
+    "problem":      "#1a0000",
+    "product":      "#00101e",
+    "benefits":     "#001a0a",
+    "social_proof": "#0e0e00",
+    "cta":          "#1a0010",
+}
+
 
 def _safe(text: str) -> str:
     """Escape text for FFmpeg drawtext."""
@@ -34,89 +44,60 @@ def make_scene(
     headline: str = "",
     subline: str = "",
 ) -> str:
-    """Render an animated motion-graphic scene MP4."""
-    out = str(tmp / f"scene_{index}.mp4")
+    """Render an animated motion-graphic scene MP4 using color source + -vf filters."""
+    out      = str(tmp / f"scene_{index}.mp4")
     duration = max(duration, 3.0)
-    pal = SCENE_PALETTES.get(scene_type, SCENE_PALETTES["product"])
-    frames = int(duration * FPS)
+    pal      = SCENE_PALETTES.get(scene_type, SCENE_PALETTES["product"])
+    bg_color = SCENE_BG_COLORS.get(scene_type, "#0a0a14")
 
-    # ── Animated gradient background using geq ────────────────────────────────
-    # Each scene type gets unique wave params so backgrounds look distinct
-    wave_params = {
-        "hook":         ("sin(2*PI*X/1080+t*1.2)*40+80",  "10", "sin(2*PI*(X+Y)/800+t*0.8)*60+20"),
-        "problem":      ("sin(2*PI*X/1080+t*0.6)*80+80",  "5",  "5"),
-        "product":      ("5",  "sin(2*PI*Y/1920+t*0.9)*40+20", "sin(2*PI*X/600+t*1.1)*80+80"),
-        "benefits":     ("5",  "sin(2*PI*(X+Y)/1000+t)*60+80", "20"),
-        "social_proof": ("sin(2*PI*X/900+t*0.5)*40+60",  "sin(2*PI*Y/1200+t*0.4)*40+60", "5"),
-        "cta":          ("sin(2*PI*X/700+t*1.4)*80+60",  "5",  "sin(2*PI*Y/800+t*1.0)*60+20"),
-    }.get(scene_type, ("30", "30", "100"))
-    r_expr, g_expr, b_expr = wave_params
-    geq = f"geq=r='{r_expr}':g='{g_expr}':b='{b_expr}'"
+    # All filters go in -vf (NOT in -i source) to avoid single-quote conflicts
+    vf_parts = []
 
-    # ── Accent bar (horizontal rule) at 1/3 height ────────────────────────────
-    accent_hex = pal["accent"].replace("0x", "")
-    accent_rgb = tuple(int(accent_hex[i:i+2], 16) for i in (0, 2, 4))
-
-    # ── Drawtext chain ────────────────────────────────────────────────────────
-    vf_parts = [f"nullsrc=size={W}x{H}:rate={FPS}", geq, "format=yuv420p"]
-
-    # Animated accent bar: fades in over first 0.5s
+    # Accent bar at 1/3 height (static — dynamic alpha breaks on some FFmpeg builds)
     vf_parts.append(
-        f"drawbox=x=80:y=h/3-4:w=w-160:h=8:"
-        f"color={pal['accent']}@'if(lt(t,0.5),t/0.5,1)':t=fill"
+        f"drawbox=x=80:y=640:w=920:h=8:color={pal['accent']}:t=fill"
     )
 
-    # Headline: big, bold, centered — slides up from y+30 to final position
+    # Headline: fade-in only (no y-expression — simpler, more compatible)
     if headline:
-        h_safe = _safe(headline[:60])
-        # Slide-up: y starts at h*0.38+30, ends at h*0.38, over 0.4s
-        y_expr = f"if(lt(t,0.4),h*0.38+30*(1-t/0.4),h*0.38)"
-        alpha_h = f"if(lt(t,0.15),0,if(lt(t,0.45),(t-0.15)/0.3,1))"
+        h_safe  = _safe(headline[:55])
+        alpha_h = "if(lt(t,0.15),0,if(lt(t,0.5),(t-0.15)/0.35,1))"
         vf_parts.append(
-            f"drawtext=text='{h_safe}':fontsize=84:fontcolor=white"
+            f"drawtext=text='{h_safe}':fontsize=80:fontcolor=white"
             f":bordercolor=black:borderw=5"
-            f":x=(w-text_w)/2:y='{y_expr}'"
+            f":x=(w-text_w)/2:y=720"
             f":alpha='{alpha_h}'"
         )
 
-    # Subline: medium, below headline
+    # Subline: fade-in delayed
     if subline:
-        s_safe = _safe(subline[:80])
-        alpha_s = f"if(lt(t,0.4),0,if(lt(t,0.7),(t-0.4)/0.3,1))"
+        s_safe  = _safe(subline[:70])
+        alpha_s = "if(lt(t,0.4),0,if(lt(t,0.75),(t-0.4)/0.35,1))"
         vf_parts.append(
-            f"drawtext=text='{s_safe}':fontsize=52:fontcolor=white@0.85"
+            f"drawtext=text='{s_safe}':fontsize=50:fontcolor=white@0.80"
             f":bordercolor=black:borderw=3"
-            f":x=(w-text_w)/2:y=h*0.50"
+            f":x=(w-text_w)/2:y=860"
             f":alpha='{alpha_s}'"
         )
 
-    # Pulsing accent dot (bottom center) — visual rhythm marker
+    # Small accent dot bottom center
     vf_parts.append(
-        f"drawbox=x=(w-24)/2:y=h-120:w=24:h=24:"
-        f"color={pal['accent']}@'0.6+0.4*sin(2*PI*t*1.5)':t=fill"
+        f"drawbox=x=528:y=1780:w=24:h=24:color={pal['accent']}:t=fill"
     )
 
-    # Build command: nullsrc as -f lavfi -i, then -vf for geq+rest
-    # Split: first vf_part is the source filter, rest are video filters
-    src_filter   = ",".join(vf_parts[:3])   # nullsrc + geq + format
-    video_filter = ",".join(vf_parts[3:])   # drawbox + drawtext etc
+    # Grade overlay
+    vf_parts.append(
+        "eq=brightness=0.02:saturation=1.22:contrast=1.10:gamma=1.04:gamma_r=1.05:gamma_b=0.96"
+    )
 
-    if video_filter:
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", src_filter,
-            "-vf", video_filter,
-            "-t", str(duration),
-            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
-            out,
-        ], check=True, capture_output=True)
-    else:
-        subprocess.run([
-            "ffmpeg", "-y",
-            "-f", "lavfi", "-i", src_filter,
-            "-t", str(duration),
-            "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
-            out,
-        ], check=True, capture_output=True)
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"color=c={bg_color}:size={W}x{H}:rate={FPS}",
+        "-vf", ",".join(vf_parts),
+        "-t", str(duration),
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        out,
+    ], check=True, capture_output=True)
 
     return out
