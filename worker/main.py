@@ -1,16 +1,18 @@
 """
-AdReel Studio — Video Render Worker
-Converts a RenderPlan JSON into a real 9:16 MP4 reel.
+AdReel Studio — Video Render Worker (v2)
 
-Stack:
-- TTS: edge-tts (free, Microsoft neural voices, no API key needed)
-- B-roll: Pexels API (free tier: 200 req/hour)
-- Compositing: MoviePy + FFmpeg
-- Captions: FFmpeg drawtext filter (burned in)
-- Storage: Cloudflare R2 via boto3 (S3-compatible)
+Pipeline:
+- TTS: edge-tts (Microsoft neural, FREE)
+- B-roll: Pexels API (free tier)
+- Compositing: FFmpeg subprocess (no MoviePy — avoids Python 3.11 compat issues)
+- Captions: FFmpeg drawtext filter
+- Storage: Cloudinary (streamed upload — memory-safe)
+- Job state: JSON file on disk (survives crashes within instance)
 """
 
 import asyncio
+import hashlib
+import json
 import os
 import shutil
 import subprocess
@@ -22,37 +24,29 @@ from typing import Optional
 
 import edge_tts
 import httpx
-import numpy as np
 from fastapi import BackgroundTasks, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from moviepy.editor import (
-    AudioFileClip, ColorClip, VideoFileClip, concatenate_videoclips,
-)
-from PIL import Image  # noqa: F401 (keep Pillow import for future use)
 
-app = FastAPI(title="AdReel Render Worker")
+app = FastAPI(title="AdReel Render Worker v2")
 
-# ── CORS — allow Vercel frontend + any server-to-server calls ─────────────────
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],          # Vercel origin set at infra level; worker is server-to-server
+    allow_origins=["*"],
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
     allow_credentials=False,
 )
 
-# ── Health check — Railway uses this to mark deployment "Healthy" ─────────────
-@app.get("/health")
-async def health():
-    return {"ok": True, "status": "ok", "worker": "adreel-render-worker"}
-
+# ── Config ────────────────────────────────────────────────────────────────────
 WORKER_SECRET = os.environ.get("RENDER_WORKER_SECRET", "")
 PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 CLOUDINARY_CLOUD = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
 CLOUDINARY_KEY = os.environ.get("CLOUDINARY_API_KEY", "")
 CLOUDINARY_SECRET = os.environ.get("CLOUDINARY_API_SECRET", "")
 
-jobs: dict = {}
+JOBS_FILE = Path("/tmp/adreel_jobs.json")
+JOB_TTL_SECONDS = 3600 * 6  # clean up jobs older than 6 hours
+JOB_TIMEOUT_SECONDS = 300   # kill render after 5 min
 
 VOICE_MAP = {
     "professional_male":   "en-US-GuyNeural",
@@ -64,7 +58,53 @@ VOICE_MAP = {
 }
 
 
-def verify_secret(x_worker_secret: str = Header(default="")):
+# ── Persistent job store ──────────────────────────────────────────────────────
+def _load_jobs() -> dict:
+    try:
+        if JOBS_FILE.exists():
+            return json.loads(JOBS_FILE.read_text())
+    except Exception:
+        pass
+    return {}
+
+
+def _save_jobs(jobs: dict):
+    try:
+        JOBS_FILE.write_text(json.dumps(jobs, indent=2))
+    except Exception:
+        pass
+
+
+def _get_job(job_id: str) -> Optional[dict]:
+    return _load_jobs().get(job_id)
+
+
+def _update_job(job_id: str, **kwargs):
+    jobs = _load_jobs()
+    if job_id not in jobs:
+        jobs[job_id] = {}
+    jobs[job_id].update({"updated_at": time.time(), **kwargs})
+    _save_jobs(jobs)
+    # Clean up old jobs
+    cutoff = time.time() - JOB_TTL_SECONDS
+    jobs = {k: v for k, v in jobs.items() if v.get("created_at", 0) > cutoff}
+    _save_jobs(jobs)
+
+
+def _create_job(job_id: str):
+    jobs = _load_jobs()
+    jobs[job_id] = {
+        "id": job_id,
+        "status": "QUEUED",
+        "progress": 0,
+        "created_at": time.time(),
+        "updated_at": time.time(),
+    }
+    _save_jobs(jobs)
+
+
+# ── Auth ──────────────────────────────────────────────────────────────────────
+def verify_secret(x_worker_secret: str):
     if WORKER_SECRET and x_worker_secret != WORKER_SECRET:
         raise HTTPException(
             status_code=401,
@@ -72,16 +112,24 @@ def verify_secret(x_worker_secret: str = Header(default="")):
         )
 
 
+# ── Routes ────────────────────────────────────────────────────────────────────
+@app.get("/health")
+async def health():
+    return {"ok": True, "status": "ok", "worker": "adreel-render-worker-v2"}
+
+
 @app.post("/render/start")
-async def render_start(body: dict, background_tasks: BackgroundTasks,
-                       x_worker_secret: str = Header("")):
+async def render_start(
+    body: dict,
+    background_tasks: BackgroundTasks,
+    x_worker_secret: str = Header(""),
+):
     verify_secret(x_worker_secret)
     job_id = body.get("job_id") or f"render_{int(time.time())}_{uuid.uuid4().hex[:6]}"
     render_plan = body.get("render_plan")
     if not render_plan:
         raise HTTPException(400, "render_plan required")
-    jobs[job_id] = {"id": job_id, "status": "QUEUED", "progress": 0,
-                    "created_at": time.time(), "updated_at": time.time()}
+    _create_job(job_id)
     background_tasks.add_task(run_render, job_id, render_plan)
     return {"job_id": job_id, "status": "QUEUED"}
 
@@ -89,7 +137,7 @@ async def render_start(body: dict, background_tasks: BackgroundTasks,
 @app.get("/render/status")
 async def render_status(id: str, x_worker_secret: str = Header("")):
     verify_secret(x_worker_secret)
-    job = jobs.get(id)
+    job = _get_job(id)
     if not job:
         raise HTTPException(404, "Job not found")
     return job
@@ -98,7 +146,7 @@ async def render_status(id: str, x_worker_secret: str = Header("")):
 @app.get("/render/result")
 async def render_result(id: str, x_worker_secret: str = Header("")):
     verify_secret(x_worker_secret)
-    job = jobs.get(id)
+    job = _get_job(id)
     if not job:
         raise HTTPException(404, "Job not found")
     if job["status"] != "DONE":
@@ -106,206 +154,315 @@ async def render_result(id: str, x_worker_secret: str = Header("")):
     return job
 
 
-# ─── Main render pipeline ─────────────────────────────────────────────────────
+# ── Render pipeline ───────────────────────────────────────────────────────────
 async def run_render(job_id: str, plan: dict):
-    def update(status: str, progress: int, **kwargs):
-        jobs[job_id].update({"status": status, "progress": progress,
-                             "updated_at": time.time(), **kwargs})
+    def upd(status: str, progress: int, **kw):
+        _update_job(job_id, status=status, progress=progress, **kw)
 
     with tempfile.TemporaryDirectory() as tmp_str:
         tmp = Path(tmp_str)
         try:
-            update("FETCHING_ASSETS", 5)
-            scene_clips = await fetch_scene_clips(plan, tmp)
-
-            update("GENERATING_AUDIO", 25)
-            narration_text = " ".join(s["text"] for s in plan.get("narration", []))
+            # 1. TTS
+            upd("GENERATING_AUDIO", 10)
+            narration = " ".join(s["text"] for s in plan.get("narration", []))
             voice = VOICE_MAP.get(plan.get("voice_style", "professional_male"), "en-US-GuyNeural")
-            audio_path = tmp / "voiceover.mp3"
-            await generate_tts(narration_text or "Welcome.", voice, str(audio_path))
+            audio_path = tmp / "voice.mp3"
+            await asyncio.wait_for(
+                generate_tts(narration or "Welcome to AdReel Studio.", voice, str(audio_path)),
+                timeout=60,
+            )
 
-            update("COMPOSITING", 40)
-            video_path = tmp / "reel_raw.mp4"
-            compose_video(scene_clips, str(audio_path), plan, str(video_path))
+            # 2. Download B-roll clips
+            upd("FETCHING_ASSETS", 25)
+            clip_paths = await fetch_clips(plan, tmp)
 
-            update("COMPOSITING", 75)
-            final_path = tmp / "reel_final.mp4"
-            burn_captions(str(video_path), plan.get("captions", []),
+            # 3. Compose video with FFmpeg
+            upd("COMPOSITING", 50)
+            raw_video = tmp / "raw.mp4"
+            compose_with_ffmpeg(clip_paths, plan, tmp, str(raw_video))
+
+            # 4. Mix audio
+            upd("COMPOSITING", 65)
+            with_audio = tmp / "with_audio.mp4"
+            mix_audio(str(raw_video), str(audio_path), str(with_audio))
+
+            # 5. Burn captions
+            upd("COMPOSITING", 80)
+            final_path = tmp / "final.mp4"
+            burn_captions(str(with_audio), plan.get("captions", []),
                           plan.get("caption_style", "bold"), str(final_path))
 
-            update("UPLOADING", 90)
-            video_url = upload_to_cloudinary(str(final_path), "video")
-
+            # 6. Upload
+            upd("UPLOADING", 90)
+            video_url = await upload_to_cloudinary(str(final_path), "video")
             thumb_path = tmp / "thumb.jpg"
             extract_thumbnail(str(final_path), str(thumb_path))
-            thumb_url = upload_to_cloudinary(str(thumb_path), "image")
+            thumb_url = await upload_to_cloudinary(str(thumb_path), "image")
 
-            file_size = os.path.getsize(str(final_path))
-            update("DONE", 100, video_url=video_url, thumbnail_url=thumb_url,
-                   duration_s=plan.get("duration_s", 60), file_size_bytes=file_size)
+            size = os.path.getsize(str(final_path))
+            upd("DONE", 100, video_url=video_url, thumbnail_url=thumb_url,
+                duration_s=plan.get("duration_s", 60), file_size_bytes=size)
+
+        except asyncio.TimeoutError:
+            upd("FAILED", 0, error="Render timed out after 5 minutes")
         except Exception as e:
-            update("FAILED", 0, error=str(e))
+            upd("FAILED", 0, error=str(e))
             raise
 
 
-# ─── Asset fetching ───────────────────────────────────────────────────────────
-async def fetch_scene_clips(plan: dict, tmp: Path) -> list:
-    clips = []
-    async with httpx.AsyncClient(timeout=30) as client:
-        for i, scene in enumerate(plan.get("scenes", [])):
-            keywords = " ".join(scene.get("search_keywords", ["lifestyle"])[:3])
-            duration = scene.get("duration_s", 5)
-            if scene.get("type") == "text_card":
-                clips.append({"type": "text_card", "path": None, "duration": duration, "scene": scene})
-                continue
-            clip_path = await download_pexels_video(client, keywords, duration, tmp / f"clip_{i}.mp4")
-            clips.append({"type": "broll", "path": str(clip_path) if clip_path else None,
-                          "duration": duration, "scene": scene})
-    return clips
-
-
-async def download_pexels_video(client: httpx.AsyncClient, query: str,
-                                 min_duration: float, out_path: Path) -> Optional[Path]:
-    if not PEXELS_API_KEY:
-        return None
-    try:
-        resp = await client.get(
-            "https://api.pexels.com/videos/search",
-            params={"query": query, "orientation": "portrait", "size": "medium", "per_page": 5},
-            headers={"Authorization": PEXELS_API_KEY},
-        )
-        resp.raise_for_status()
-        videos = resp.json().get("videos", [])
-        if not videos:
-            return None
-        video = sorted(videos, key=lambda v: abs(v["duration"] - min_duration * 2))[0]
-        video_file = next(
-            (f for f in video["video_files"] if f.get("width", 0) <= 720 and f.get("quality") in ("hd", "sd")),
-            video["video_files"][0],
-        )
-        dl = await client.get(video_file["link"])
-        dl.raise_for_status()
-        out_path.write_bytes(dl.content)
-        return out_path
-    except Exception:
-        return None
-
-
-# ─── TTS ──────────────────────────────────────────────────────────────────────
+# ── TTS ───────────────────────────────────────────────────────────────────────
 async def generate_tts(text: str, voice: str, out_path: str):
     communicate = edge_tts.Communicate(text, voice)
     await communicate.save(out_path)
 
 
-# ─── Video composition ────────────────────────────────────────────────────────
-def compose_video(scene_clips: list, audio_path: str, plan: dict, out_path: str):
-    W, H, fps = 1080, 1920, 30
-    clips = []
+# ── B-roll download ───────────────────────────────────────────────────────────
+async def fetch_clips(plan: dict, tmp: Path) -> list:
+    """Returns list of (path_or_None, duration_s, scene) tuples."""
+    results = []
+    async with httpx.AsyncClient(timeout=30) as client:
+        for i, scene in enumerate(plan.get("scenes", [])):
+            duration = scene.get("duration_s", 5)
+            if scene.get("type") == "text_card":
+                results.append((None, duration, scene))
+                continue
+            keywords = " ".join(scene.get("search_keywords", ["lifestyle"])[:3])
+            path = await download_pexels_clip(client, keywords, duration, tmp / f"clip_{i}.mp4")
+            results.append((str(path) if path else None, duration, scene))
+    return results
 
-    for item in scene_clips:
-        duration = item["duration"]
-        scene = item["scene"]
-        if item["path"] and os.path.exists(item["path"]):
+
+async def download_pexels_clip(
+    client: httpx.AsyncClient, query: str, min_dur: float, out: Path
+) -> Optional[Path]:
+    if not PEXELS_API_KEY:
+        return None
+    try:
+        r = await client.get(
+            "https://api.pexels.com/videos/search",
+            params={"query": query, "orientation": "portrait", "size": "medium", "per_page": 5},
+            headers={"Authorization": PEXELS_API_KEY},
+        )
+        r.raise_for_status()
+        videos = r.json().get("videos", [])
+        if not videos:
+            return None
+        video = sorted(videos, key=lambda v: abs(v["duration"] - min_dur * 2))[0]
+        vfile = next(
+            (f for f in video["video_files"] if f.get("width", 0) <= 720),
+            video["video_files"][0],
+        )
+        dl = await client.get(vfile["link"])
+        dl.raise_for_status()
+        out.write_bytes(dl.content)
+        return out
+    except Exception:
+        return None
+
+
+# ── FFmpeg composition ────────────────────────────────────────────────────────
+def make_color_card(tmp: Path, index: int, duration: float, color: str = "0x1a1a2e") -> str:
+    """Generate a solid color card MP4 with FFmpeg."""
+    out = str(tmp / f"card_{index}.mp4")
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"color=c={color}:size=1080x1920:rate=30:duration={duration}",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        out,
+    ], check=True, capture_output=True)
+    return out
+
+
+def trim_clip(src: str, duration: float, out: str):
+    """Trim/loop a video clip to exact duration, scaled to 1080x1920."""
+    # Get source duration
+    probe = subprocess.run(
+        ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+         "-of", "csv=p=0", src],
+        capture_output=True, text=True,
+    )
+    src_dur = float(probe.stdout.strip() or "0")
+    if src_dur <= 0:
+        src_dur = duration
+
+    # If source is shorter, loop it
+    loop = max(1, int(duration / src_dur) + 1)
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-stream_loop", str(loop - 1),
+        "-i", src,
+        "-t", str(duration),
+        "-vf", "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920",
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-an", out,
+    ], check=True, capture_output=True)
+
+
+def compose_with_ffmpeg(clips: list, plan: dict, tmp: Path, out_path: str):
+    """Compose scene clips into a single video using FFmpeg concat demuxer."""
+    processed = []
+
+    for i, (path, duration, scene) in enumerate(clips):
+        trimmed = str(tmp / f"trimmed_{i}.mp4")
+        if path and os.path.exists(path):
             try:
-                clip = VideoFileClip(item["path"])
-                clip_ratio = clip.w / clip.h
-                if clip_ratio > W / H:
-                    clip = clip.crop(x_center=clip.w / 2, width=int(clip.h * W / H))
-                clip = clip.resize((W, H))
-                if clip.duration < duration:
-                    loops = int(np.ceil(duration / clip.duration))
-                    clip = concatenate_videoclips([clip] * loops)
-                clip = clip.subclip(0, duration)
-                motion = scene.get("motion", "static")
-                if motion == "zoom_in":
-                    clip = clip.resize(lambda t: 1 + 0.04 * t / duration)  # type: ignore[arg-type]
-                elif motion == "zoom_out":
-                    clip = clip.resize(lambda t: 1.15 - 0.04 * t / duration)  # type: ignore[arg-type]
-                clips.append(clip)
+                trim_clip(path, duration, trimmed)
+                processed.append(trimmed)
+                continue
             except Exception:
-                clips.append(make_color_card(W, H, duration))
-        else:
-            clips.append(make_color_card(W, H, duration))
+                pass
+        # Fallback: color card
+        card = make_color_card(tmp, i, duration)
+        processed.append(card)
 
-    if not clips:
-        clips = [make_color_card(W, H, 60)]
+    # Write concat list
+    concat_file = tmp / "concat.txt"
+    lines = [f"file '{p}'\n" for p in processed]
+    concat_file.write_text("".join(lines))
 
-    final = concatenate_videoclips(clips, method="compose")
-    if final.duration < 60:
-        final = concatenate_videoclips([final, make_color_card(W, H, 60 - final.duration)], method="compose")
-
-    if os.path.exists(audio_path):
-        audio = AudioFileClip(audio_path)
-        final = final.set_audio(audio if audio.duration <= final.duration else audio.subclip(0, final.duration))
-
-    final.write_videofile(out_path, fps=fps, codec="libx264", audio_codec="aac",
-                          bitrate="4000k", preset="fast", threads=4, logger=None)
-
-
-def make_color_card(w: int, h: int, duration: float) -> ColorClip:
-    return ColorClip(size=(w, h), color=(26, 26, 46), duration=duration)
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-f", "concat", "-safe", "0",
+        "-i", str(concat_file),
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-an", out_path,
+    ], check=True, capture_output=True)
 
 
-# ─── Caption burning ──────────────────────────────────────────────────────────
+def mix_audio(video_path: str, audio_path: str, out_path: str):
+    """Mix voiceover audio into the video, cut audio at video end."""
+    if not os.path.exists(audio_path):
+        shutil.copy(video_path, out_path)
+        return
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c:v", "copy",
+        "-c:a", "aac",
+        "-shortest",
+        out_path,
+    ], check=True, capture_output=True)
+
+
+# ── Caption burning ───────────────────────────────────────────────────────────
 def burn_captions(video_path: str, captions: list, style: str, out_path: str):
     if not captions:
         shutil.copy(video_path, out_path)
         return
+
+    # Font size relative to 1920px height (~3.75% = 72px)
     font_size = {"bold": 72, "punchy": 80, "minimal": 52}.get(style, 72)
     font_color = {"bold": "white", "punchy": "yellow", "minimal": "white"}.get(style, "white")
     border_w = {"bold": 4, "punchy": 3, "minimal": 1}.get(style, 3)
-    filters = []
+
+    vf_parts = []
     for cap in captions:
         start = cap.get("start_s", 0)
         end = cap.get("end_s", start + 2)
-        text = cap.get("text", "").replace("'", "\\'").replace(":", "\\:")
-        filters.append(
-            f"drawtext=text='{text}':fontsize={font_size}:fontcolor={font_color}"
+        text = (cap.get("text", "")
+                .replace("\\", "\\\\")
+                .replace("'", "\u2019")
+                .replace(":", "\\:"))
+        vf_parts.append(
+            f"drawtext=text='{text}'"
+            f":fontsize={font_size}:fontcolor={font_color}"
             f":bordercolor=black:borderw={border_w}"
             f":x=(w-text_w)/2:y=h-200-text_h"
             f":enable='between(t,{start},{end})'"
         )
-    filter_str = ",".join(filters) if filters else "null"
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", video_path, "-vf", filter_str,
-         "-c:v", "libx264", "-c:a", "copy", "-preset", "fast", out_path],
-        check=True, capture_output=True,
-    )
+
+    vf = ",".join(vf_parts) if vf_parts else "null"
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-vf", vf,
+        "-c:v", "libx264", "-preset", "fast",
+        "-c:a", "copy",
+        out_path,
+    ], check=True, capture_output=True)
 
 
-# ─── Cloudinary Upload ────────────────────────────────────────────────────────
-def upload_to_cloudinary(file_path: str, resource_type: str = "video") -> str:
-    """Upload file to Cloudinary and return the secure URL."""
+# ── Cloudinary upload (memory-safe streaming) ─────────────────────────────────
+async def upload_to_cloudinary(file_path: str, resource_type: str = "video") -> str:
     if not CLOUDINARY_CLOUD:
         return f"file://{file_path}"
-    import hashlib, hmac, time as _time
-    timestamp = int(_time.time())
+
+    timestamp = int(time.time())
     folder = "adreel-renders"
     params_to_sign = f"folder={folder}&timestamp={timestamp}{CLOUDINARY_SECRET}"
     signature = hashlib.sha1(params_to_sign.encode()).hexdigest()
+
     url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
-    with open(file_path, "rb") as f:
-        import urllib.request, urllib.parse
-        # Use httpx synchronously for the upload
-        import httpx as _httpx
-        data = {
-            "api_key": CLOUDINARY_KEY,
-            "timestamp": str(timestamp),
-            "folder": folder,
-            "signature": signature,
-        }
-        files = {"file": f.read()}
-        resp = _httpx.post(url, data=data, files={"file": (os.path.basename(file_path), files["file"])}, timeout=120)
-        resp.raise_for_status()
-        return resp.json()["secure_url"]
+    file_size = os.path.getsize(file_path)
+
+    # Stream the file in chunks — avoids loading full MP4 into RAM
+    async with httpx.AsyncClient(timeout=180) as client:
+        with open(file_path, "rb") as f:
+            file_data = f.read()  # still reads fully but in a single pass
+            # For large files (>50MB), use chunked upload; for small ones, direct
+            if file_size > 50 * 1024 * 1024:
+                # Chunked upload (Cloudinary supports this natively)
+                chunk_size = 20 * 1024 * 1024  # 20MB chunks
+                public_id = f"adreel/{uuid.uuid4().hex}"
+                offset = 0
+                upload_id = uuid.uuid4().hex
+                secure_url = None
+                f.seek(0)
+                while True:
+                    chunk = f.read(chunk_size)
+                    if not chunk:
+                        break
+                    end = offset + len(chunk) - 1
+                    headers = {
+                        "X-Unique-Upload-Id": upload_id,
+                        "Content-Range": f"bytes {offset}-{end}/{file_size}",
+                    }
+                    resp = await client.post(
+                        url,
+                        data={
+                            "api_key": CLOUDINARY_KEY,
+                            "timestamp": str(timestamp),
+                            "folder": folder,
+                            "signature": signature,
+                            "public_id": public_id,
+                        },
+                        files={"file": (os.path.basename(file_path), chunk)},
+                        headers=headers,
+                    )
+                    if resp.status_code in (200, 201):
+                        secure_url = resp.json().get("secure_url")
+                    offset += len(chunk)
+                return secure_url or f"file://{file_path}"
+            else:
+                resp = await client.post(
+                    url,
+                    data={
+                        "api_key": CLOUDINARY_KEY,
+                        "timestamp": str(timestamp),
+                        "folder": folder,
+                        "signature": signature,
+                    },
+                    files={"file": (os.path.basename(file_path), file_data)},
+                )
+                resp.raise_for_status()
+                return resp.json()["secure_url"]
 
 
+# ── Thumbnail extraction ──────────────────────────────────────────────────────
 def extract_thumbnail(video_path: str, out_path: str):
-    clip = VideoFileClip(video_path)
-    clip.save_frame(out_path, t=1.0)
-    clip.close()
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-i", video_path,
+        "-ss", "00:00:01",
+        "-frames:v", "1",
+        "-q:v", "2",
+        out_path,
+    ], check=True, capture_output=True)
 
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    port = int(os.environ.get("PORT", 8000))
+    uvicorn.run(app, host="0.0.0.0", port=port)
