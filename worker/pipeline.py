@@ -18,6 +18,7 @@ from ffmpeg_utils import (
 )
 from scenes_templates import make_scene
 from captions import generate_ass, _WHISPER_AVAILABLE
+from ai_images import fetch_ai_image, image_to_video, build_prompt as build_img_prompt
 
 # ── Config ────────────────────────────────────────────────────────────────────
 RENDER_MODE  = os.environ.get("RENDER_MODE", "motion")   # stock|motion|ai
@@ -279,8 +280,8 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
                             u("FETCHING_ASSETS", 15 + i * 5)
                             continue
 
-                    # Mode stock: Pexels
-                    if mode in ("stock", "ai") and PEXELS_KEY:
+                    # Try Pexels stock footage first
+                    if PEXELS_KEY:
                         clip = await fetch_pexels(client, kws, SCENE_DUR, raw)
                         if clip and clip.exists():
                             try:
@@ -291,7 +292,25 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
                             except Exception:
                                 pass
 
-                    # Mode motion (or fallback): animated template
+                    # Fallback 1: AI-generated image via Pollinations.ai (free, no GPU)
+                    img_prompt  = build_img_prompt(
+                        stype, kws,
+                        scene.get("visual_description", ""),
+                    )
+                    img_path    = tmp / f"ai_img_{i}.jpg"
+                    MOTIONS     = ["zoom_in", "zoom_out", "pan_right", "zoom_in", "zoom_out", "pan_left"]
+                    ai_img      = await fetch_ai_image(img_prompt, img_path, seed=42 + i)
+                    if ai_img and ai_img.exists():
+                        try:
+                            image_to_video(str(ai_img), SCENE_DUR, proc,
+                                           motion=MOTIONS[i % len(MOTIONS)])
+                            clips.append(proc)
+                            u("FETCHING_ASSETS", 15 + i * 5)
+                            continue
+                        except Exception:
+                            pass
+
+                    # Fallback 2: motion-graphic template
                     mg = make_scene(
                         tmp, i, stype, SCENE_DUR,
                         headline=headlines[i] if i < len(headlines) else "",
