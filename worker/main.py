@@ -172,6 +172,19 @@ async def run_render(job_id: str, plan: dict):
                 timeout=60,
             )
 
+            # Measure TTS audio duration — scale scenes to match
+            audio_dur = get_audio_duration(str(audio_path))
+            if audio_dur > 0:
+                scenes = plan.get("scenes", [])
+                total_scene_dur = sum(float(s.get("duration_s", 5)) for s in scenes)
+                if total_scene_dur < 1:
+                    total_scene_dur = 60.0
+                if abs(total_scene_dur - audio_dur) > 2:
+                    scale = audio_dur / total_scene_dur
+                    for s in scenes:
+                        s["duration_s"] = float(s.get("duration_s", 5)) * scale
+                plan["duration_s"] = audio_dur
+
             # 2. Download B-roll clips
             upd("FETCHING_ASSETS", 25)
             clip_paths = await fetch_clips(plan, tmp)
@@ -181,10 +194,10 @@ async def run_render(job_id: str, plan: dict):
             raw_video = tmp / "raw.mp4"
             compose_with_ffmpeg(clip_paths, plan, tmp, str(raw_video))
 
-            # 4. Mix audio
+            # 4. Mix audio (loop/trim video to match audio — no -shortest truncation)
             upd("COMPOSITING", 65)
             with_audio = tmp / "with_audio.mp4"
-            mix_audio(str(raw_video), str(audio_path), str(with_audio))
+            mix_audio_sync(str(raw_video), str(audio_path), str(with_audio))
 
             # 5. Burn captions
             upd("COMPOSITING", 80)
@@ -261,13 +274,51 @@ async def download_pexels_clip(
 
 
 # ── FFmpeg composition ────────────────────────────────────────────────────────
-def make_color_card(tmp: Path, index: int, duration: float, color: str = "0x1a1a2e") -> str:
-    """Generate a solid color card MP4 with FFmpeg."""
+def get_audio_duration(path: str) -> float:
+    """Return audio duration in seconds via ffprobe."""
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "csv=p=0", path],
+            capture_output=True, text=True,
+        )
+        return float(r.stdout.strip() or "0")
+    except Exception:
+        return 0.0
+
+
+def make_color_card(tmp: Path, index: int, duration: float,
+                    color: str = "0x1a1a2e", overlay_text: list | None = None) -> str:
+    """Generate an animated gradient card MP4 with optional text overlay."""
     out = str(tmp / f"card_{index}.mp4")
+    # Animated purple-blue gradient via geq (no external assets needed)
+    geq = (
+        "geq="
+        "r='30+20*sin(2*PI*X/1080+t*0.4)':"
+        "g='10+5*cos(2*PI*Y/1920+t*0.3)':"
+        "b='120+80*sin(2*PI*(X+Y)/1200+t*0.6)'"
+    )
+    vf = f"nullsrc=size=1080x1920:rate=30,{geq},format=yuv420p"
+
+    # Add text overlays if provided
+    if overlay_text:
+        for line_idx, line in enumerate(overlay_text[:4]):
+            safe = (str(line)
+                    .replace("\\", "\\\\")
+                    .replace("'", "\u2019")
+                    .replace(":", "\\:"))
+            y_pos = 760 + line_idx * 110  # centre of frame
+            vf += (
+                f",drawtext=text='{safe}'"
+                f":fontsize=72:fontcolor=white"
+                f":bordercolor=black:borderw=4"
+                f":x=(w-text_w)/2:y={y_pos}"
+            )
+
     subprocess.run([
         "ffmpeg", "-y",
-        "-f", "lavfi",
-        "-i", f"color=c={color}:size=1080x1920:rate=30:duration={duration}",
+        "-f", "lavfi", "-i", vf,
+        "-t", str(duration),
         "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
         out,
     ], check=True, capture_output=True)
@@ -312,8 +363,9 @@ def compose_with_ffmpeg(clips: list, plan: dict, tmp: Path, out_path: str):
                 continue
             except Exception:
                 pass
-        # Fallback: color card
-        card = make_color_card(tmp, i, duration)
+        # Fallback: animated gradient card with optional text overlay
+        overlay = scene.get("overlay_text") or scene.get("on_screen_text")
+        card = make_color_card(tmp, i, duration, overlay_text=overlay)
         processed.append(card)
 
     # Write concat list
@@ -342,6 +394,30 @@ def mix_audio(video_path: str, audio_path: str, out_path: str):
         "-c:v", "copy",
         "-c:a", "aac",
         "-shortest",
+        out_path,
+    ], check=True, capture_output=True)
+
+
+def mix_audio_sync(video_path: str, audio_path: str, out_path: str):
+    """Loop/trim video to match audio duration exactly, then mux."""
+    if not os.path.exists(audio_path):
+        shutil.copy(video_path, out_path)
+        return
+    audio_dur = get_audio_duration(audio_path)
+    video_dur = get_audio_duration(video_path)  # works for video too
+    if audio_dur <= 0:
+        shutil.copy(video_path, out_path)
+        return
+    # If video is shorter, loop it; then trim to audio length
+    loops = max(1, int(audio_dur / max(video_dur, 0.1)) + 1)
+    subprocess.run([
+        "ffmpeg", "-y",
+        "-stream_loop", str(loops - 1),
+        "-i", video_path,
+        "-i", audio_path,
+        "-t", str(audio_dur),
+        "-c:v", "libx264", "-preset", "fast", "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
         out_path,
     ], check=True, capture_output=True)
 
