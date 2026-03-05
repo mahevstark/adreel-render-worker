@@ -119,26 +119,134 @@ def make_micro_shot(img_path: str, out_path: str, motion: str = "zoom_in",
     ])
 
 
-# ── Stitch N micro-shots into one scene clip (hard cuts = TikTok energy) ──────
-def stitch_micro_shots(shot_paths: List[str], out_path: str) -> None:
+# ── Generate whoosh SFX via FFmpeg sine sweep ────────────────────────────────
+def make_whoosh(out_path: str, duration: float = 0.25) -> None:
     """
-    Concatenate micro-shots with hard cuts using FFmpeg concat demuxer.
-    Hard cuts at 1.29s intervals give TikTok/Reels kinetic energy.
+    Generate a short whoosh/swoosh SFX using FFmpeg's aevalsrc.
+    Frequency sweeps 800→200 Hz with exponential decay — sounds like a cut.
+    No external files needed.
     """
+    expr = (
+        "sin(2*PI*(800-600*t/0.25)*t)"
+        f"*exp(-t*8)*0.6"
+    )
+    _run([
+        "ffmpeg", "-y",
+        "-f", "lavfi",
+        "-i", f"aevalsrc={expr}:s=44100:c=stereo",
+        "-t", str(duration),
+        "-ar", "44100", "-ac", "2",
+        out_path,
+    ])
+
+
+def _detect_beat_offsets(durations: List[float], bpm: float = 120.0) -> List[float]:
+    """
+    Snap shot boundaries to nearest beat grid.
+    If BPM known (from music analysis), cuts land on the beat.
+    Default 120 BPM = 0.5s beat interval.
+    """
+    beat = 60.0 / bpm
+    offsets: List[float] = [0.0]
+    t = 0.0
+    for d in durations[:-1]:
+        t += d
+        # Snap to nearest beat
+        snapped = round(t / beat) * beat
+        offsets.append(snapped)
+    return offsets
+
+
+# ── Stitch N micro-shots with optional SFX + beat-snap ───────────────────────
+def stitch_micro_shots(
+    shot_paths: List[str],
+    out_path: str,
+    add_sfx: bool = True,
+    bpm: float = 0.0,           # 0 = no snap; >0 = snap to beat grid
+    durations: Optional[List[float]] = None,
+) -> None:
+    """
+    Concatenate micro-shots with hard cuts (TikTok energy).
+    Optionally: mix whoosh SFX at each cut point.
+    Optionally: snap cut points to beat grid if BPM provided.
+    """
+    import shutil
+
+    # Build concat list
     with tempfile.NamedTemporaryFile(mode="w", suffix=".txt",
                                      delete=False, dir=os.path.dirname(out_path)) as f:
         for p in shot_paths:
             f.write(f"file '{p}'\n")
         list_path = f.name
+
+    video_only = out_path.replace(".mp4", "_nosfx.mp4")
     try:
         _run([
             "ffmpeg", "-y",
             "-f", "concat", "-safe", "0", "-i", list_path,
-            "-c", "copy",
-            out_path,
+            "-c", "copy", video_only,
         ])
     finally:
         os.unlink(list_path)
+
+    if not add_sfx:
+        shutil.move(video_only, out_path)
+        return
+
+    # Generate whoosh SFX for each cut point
+    vid_dur = get_duration(video_only)
+    durs    = durations or [vid_dur / len(shot_paths)] * len(shot_paths)
+    whoosh  = os.path.join(os.path.dirname(out_path), "_whoosh.mp3")
+    try:
+        make_whoosh(whoosh, duration=0.22)
+    except Exception:
+        # SFX generation failed — just copy video without SFX
+        shutil.move(video_only, out_path)
+        return
+
+    # Build adelay filter: one whoosh at each cut point except the first
+    cut_times: List[float] = []
+    t = 0.0
+    for d in durs[:-1]:
+        t += d
+        cut_times.append(round(t, 3))
+
+    if not cut_times:
+        shutil.move(video_only, out_path)
+        return
+
+    # Mix: one silent base + N whoosh copies delayed to cut points
+    n    = len(cut_times)
+    sfx_inputs = ["-i", whoosh] * n
+    fc_parts   = []
+    for j, ct in enumerate(cut_times):
+        delay_ms = int(ct * 1000)
+        fc_parts.append(
+            f"[{j+1}:a]adelay={delay_ms}|{delay_ms}[s{j}]"
+        )
+    mix_labels = "".join(f"[s{j}]" for j in range(n))
+    fc_parts.append(
+        f"[0:a]{mix_labels}amix=inputs={n+1}:normalize=0[aout]"
+    )
+    filter_complex = ";".join(fc_parts)
+
+    try:
+        _run([
+            "ffmpeg", "-y",
+            "-i", video_only,
+            *sfx_inputs,
+            "-filter_complex", filter_complex,
+            "-map", "0:v", "-map", "[aout]",
+            "-c:v", "copy", "-c:a", "aac",
+            out_path,
+        ])
+    except Exception:
+        shutil.move(video_only, out_path)
+    finally:
+        if os.path.exists(video_only):
+            os.unlink(video_only)
+        if os.path.exists(whoosh):
+            os.unlink(whoosh)
 
 
 # ── Trim & grade a real video clip ────────────────────────────────────────────

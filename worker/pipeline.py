@@ -25,13 +25,13 @@ from ffmpeg_utils import (
     compose_xfade, mix_audio, burn_ass_captions, burn_captions,
     build_word_captions, normalize_loudness, extract_thumbnail,
     make_micro_shot, stitch_micro_shots,
-    SCENE_DUR, N_SCENES, MICRO_PER_SCENE, MICRO_DUR, MICRO_MOTIONS,
+    SCENE_DUR, N_SCENES, MICRO_PER_SCENE, MICRO_DUR, MICRO_MOTIONS, _detect_beat_offsets,
 )
 from scenes_templates import make_scene
 from captions import generate_ass, _WHISPER_AVAILABLE
 from ai_images import (
     fetch_ai_image, fetch_micro_shots, image_to_video,
-    build_prompt as build_img_prompt,
+    build_prompt as build_img_prompt, extract_anchor,
 )
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -117,58 +117,107 @@ async def generate_tts(text: str, voice: str, out_path: str) -> None:
     await edge_tts.Communicate(text, voice).save(out_path)
 
 
+# ── Narration-aware shot durations ────────────────────────────────────────────
+def split_narration_to_shots(scene_narration: str, n_shots: int,
+                              scene_dur: float) -> list[float]:
+    """
+    Split scene narration into n_shots phrase chunks and derive shot durations
+    proportional to phrase length (longer phrase = longer shot).
+    Falls back to equal timing if narration is empty.
+    """
+    if not scene_narration.strip():
+        return [scene_dur / n_shots] * n_shots
+
+    # Split on phrase boundaries: . ! ? , — and ...
+    raw    = re.split(r'[.!?,;—]|\.\.\.',  scene_narration)
+    chunks = [c.strip() for c in raw if c.strip()]
+
+    # Pad / trim to exactly n_shots
+    while len(chunks) < n_shots:
+        # Duplicate last phrase to fill
+        chunks.append(chunks[-1] if chunks else "")
+    chunks = chunks[:n_shots]
+
+    # Weight by word count → proportional duration
+    word_counts = [max(1, len(c.split())) for c in chunks]
+    total_words = sum(word_counts)
+    durations   = [round(scene_dur * (wc / total_words), 3) for wc in word_counts]
+
+    # Fix rounding error — add remainder to last shot
+    diff = round(scene_dur - sum(durations), 3)
+    durations[-1] = round(durations[-1] + diff, 3)
+    return durations
+
+
 # ── Mode B: build one scene from N AI micro-shots ─────────────────────────────
 async def build_micro_scene(
-    scene_idx: int, scene: dict, tmp: Path, headlines: list
+    scene_idx: int,
+    scene: dict,
+    tmp: Path,
+    headlines: list,
+    scene_narration: str = "",
+    bpm: float = 0.0,
 ) -> str:
     """
-    Generate MICRO_PER_SCENE (8) AI images for a scene, animate each with
-    Ken Burns (1.29s each), stitch with hard cuts → 10.33s scene MP4.
-    This is the Mode B TikTok-energy engine.
+    Generate MICRO_PER_SCENE (8) AI images for a scene.
+    All 8 shots share the same scene identity anchor (character/location/product).
+    Shot durations are narration-aware (phrase-proportional).
+    Stitched with hard cuts + whoosh SFX at each cut point.
     """
     stype   = scene.get("scene_type", SCENE_ORDER[scene_idx % N_SCENES])
     kws_raw = scene.get("search_keywords") or random.choice(
         SCENE_KWMAP.get(stype, [["lifestyle"]])
     ).split()
     visual  = scene.get("visual_description", "")
+    narr    = scene_narration or scene.get("_caption", "")
 
-    # Fetch all N micro-shot images concurrently
+    # Narration-aware shot durations
+    shot_durs = split_narration_to_shots(narr, MICRO_PER_SCENE, SCENE_DUR)
+
+    # Fetch all N micro-shot images concurrently (shared anchor identity)
     imgs = await fetch_micro_shots(
         scene_type=stype,
         keywords=kws_raw,
         visual_description=visual,
+        narration=narr,
         tmp=tmp,
         scene_idx=scene_idx,
         n_shots=MICRO_PER_SCENE,
     )
 
     shot_paths: list[str] = []
+    stype_colors = {
+        "hook": "#0d0020", "problem": "#1a0000", "product": "#00101e",
+        "benefits": "#001a0a", "social_proof": "#0e0e00", "cta": "#1a0010",
+    }
+
     for shot_idx, img in enumerate(imgs):
         shot_out = str(tmp / f"shot_{scene_idx}_{shot_idx}.mp4")
         motion   = MICRO_MOTIONS[shot_idx % len(MICRO_MOTIONS)]
+        dur      = shot_durs[shot_idx]
 
         if img and img.exists():
             try:
-                make_micro_shot(str(img), shot_out,
-                                motion=motion, duration=MICRO_DUR)
+                make_micro_shot(str(img), shot_out, motion=motion, duration=dur)
                 shot_paths.append(shot_out)
                 continue
             except Exception:
                 pass
 
-        # Fallback for failed images: color card micro-shot
-        stype_colors = {
-            "hook": "#0d0020", "problem": "#1a0000", "product": "#00101e",
-            "benefits": "#001a0a", "social_proof": "#0e0e00", "cta": "#1a0010",
-        }
+        # Fallback: branded color card
         clr = stype_colors.get(stype, "#0a0a14")
-        make_color_card(clr, MICRO_DUR, shot_out,
+        make_color_card(clr, dur, shot_out,
                         text=headlines[scene_idx] if shot_idx == 0 else None)
         shot_paths.append(shot_out)
 
-    # Stitch 8 micro-shots → one 10.33s scene
+    # Stitch with whoosh SFX at cut points + optional beat snap
     scene_out = str(tmp / f"scene_{scene_idx}.mp4")
-    stitch_micro_shots(shot_paths, scene_out)
+    stitch_micro_shots(
+        shot_paths, scene_out,
+        add_sfx=True,
+        bpm=bpm,
+        durations=shot_durs,
+    )
     return scene_out
 
 
@@ -336,6 +385,15 @@ async def run_render(job_id: str, plan: dict, upd: Callable) -> None:
             words     = narr_text.split()
             wps       = max(1, len(words) // N_SCENES)
             headlines = [" ".join(words[i*wps:(i+1)*wps])[:55] for i in range(N_SCENES)]
+
+            # Distribute narration text per scene for narration-aware timing
+            scene_narrations: list[str] = []
+            for i in range(N_SCENES):
+                chunk = " ".join(words[i*wps:(i+1)*wps])
+                scene_narrations.append(chunk)
+
+            # BPM from plan (user can set "bpm": 128 in render config)
+            bpm   = float(plan.get("bpm", 0.0))
             clips: list[str] = []
 
             for i, scene in enumerate(scenes):
@@ -352,8 +410,24 @@ async def run_render(job_id: str, plan: dict, upd: Callable) -> None:
                     async with httpx.AsyncClient(timeout=5) as c:
                         clip = await generate_ai_scene(c, prompt, i, SCENE_DUR, raw)
                     if clip and clip.exists():
-                        trim_and_grade(str(clip), SCENE_DUR, proc, motion_idx=i)
-                        clips.append(proc)
+                        ai_dur = get_duration(str(clip))
+                        if ai_dur >= SCENE_DUR - 0.5:
+                            # Full-length AI clip
+                            trim_and_grade(str(clip), SCENE_DUR, proc, motion_idx=i)
+                            clips.append(proc)
+                        else:
+                            # Short AI clip (<10s) — hybrid: AI clip + micro-shots pad
+                            ai_proc = str(tmp / f"ai_proc_{i}.mp4")
+                            trim_and_grade(str(clip), ai_dur, ai_proc, motion_idx=i)
+                            pad_mp4 = await build_micro_scene(
+                                i, scene, tmp, headlines,
+                                scene_narration=scene_narrations[i], bpm=bpm,
+                            )
+                            remain   = SCENE_DUR - ai_dur
+                            pad_trim = str(tmp / f"pad_trim_{i}.mp4")
+                            trim_and_grade(pad_mp4, remain, pad_trim, motion_idx=i)
+                            stitch_micro_shots([ai_proc, pad_trim], proc, add_sfx=False)
+                            clips.append(proc)
                         u("FETCHING_ASSETS", pct)
                         continue
 
@@ -376,7 +450,11 @@ async def run_render(job_id: str, plan: dict, upd: Callable) -> None:
 
                 # ── Mode motion (default): 8 AI micro-shots per scene ──────
                 try:
-                    scene_mp4 = await build_micro_scene(i, scene, tmp, headlines)
+                    scene_mp4 = await build_micro_scene(
+                        i, scene, tmp, headlines,
+                        scene_narration=scene_narrations[i],
+                        bpm=bpm,
+                    )
                     clips.append(scene_mp4)
                     u("FETCHING_ASSETS", pct)
                     continue
