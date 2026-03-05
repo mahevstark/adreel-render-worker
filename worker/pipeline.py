@@ -1,7 +1,17 @@
 """
-AdReel render pipeline v4
-RENDER_MODE: stock (Pexels) | motion (templates, default) | ai (Modal GPU)
-Features: Whisper captions, EBU R128, sentence-paced TTS, exact 60s, music ducking.
+AdReel render pipeline v5
+─────────────────────────────────────────────────────────────────────────────
+RENDER_MODE env var:
+  motion  (default) — Mode B: 8 AI micro-shots per scene, Ken Burns, hard cuts
+  stock              — Mode B with Pexels clips (one per scene)
+  ai                 — Mode A: GPU text-to-video via Modal CogVideoX endpoint
+
+⚠️  Railway CPU CANNOT run CogVideoX/Wan2.1/LTX-Video.
+    Those models require 8–24 GB VRAM. Mode A needs MODAL_ENDPOINT set.
+    Mode B on CPU is the free, shippable path.
+
+60s formula: SCENE_DUR = (60 + 5×0.4) / 6 = 10.3333s
+             per micro-shot = 10.3333 / 8 = 1.2917s
 """
 import asyncio, hashlib, os, random, re, time, uuid
 from pathlib import Path
@@ -14,17 +24,21 @@ from ffmpeg_utils import (
     get_duration, trim_and_grade, make_color_card,
     compose_xfade, mix_audio, burn_ass_captions, burn_captions,
     build_word_captions, normalize_loudness, extract_thumbnail,
-    SCENE_DUR, N_SCENES,
+    make_micro_shot, stitch_micro_shots,
+    SCENE_DUR, N_SCENES, MICRO_PER_SCENE, MICRO_DUR, MICRO_MOTIONS,
 )
 from scenes_templates import make_scene
 from captions import generate_ass, _WHISPER_AVAILABLE
-from ai_images import fetch_ai_image, image_to_video, build_prompt as build_img_prompt
+from ai_images import (
+    fetch_ai_image, fetch_micro_shots, image_to_video,
+    build_prompt as build_img_prompt,
+)
 
 # ── Config ────────────────────────────────────────────────────────────────────
-RENDER_MODE  = os.environ.get("RENDER_MODE", "motion")   # stock|motion|ai
+RENDER_MODE  = os.environ.get("RENDER_MODE", "motion")   # motion|stock|ai
 PEXELS_KEY   = os.environ.get("PEXELS_API_KEY", "")
-MUSIC_URL    = os.environ.get("BACKGROUND_MUSIC_URL", "")  # optional royalty-free URL
-MODAL_EP     = os.environ.get("MODAL_ENDPOINT", "")        # Mode A GPU endpoint
+MUSIC_URL    = os.environ.get("BACKGROUND_MUSIC_URL", "")
+MODAL_EP     = os.environ.get("MODAL_ENDPOINT", "")       # Mode A — requires GPU
 
 CLOUDINARY_CLOUD  = os.environ.get("CLOUDINARY_CLOUD_NAME", "")
 CLOUDINARY_KEY    = os.environ.get("CLOUDINARY_API_KEY", "")
@@ -40,30 +54,32 @@ VOICE_MAP = {
 }
 
 SCENE_KWMAP = {
-    "hook":         ["close up face surprise reaction", "problem frustration struggle"],
-    "problem":      ["stress overwhelmed difficulty searching", "tired exhausted person"],
-    "product":      ["product unboxing reveal packaging", "delivery package door arrival"],
-    "benefits":     ["happy satisfied family smile success", "comfortable convenient lifestyle"],
-    "social_proof": ["customer happy satisfied review", "positive results achievement people"],
-    "cta":          ["phone ordering online shopping app", "click button purchase delivery"],
+    "hook":         ["close up face surprise reaction frustrated",
+                     "person panic problem searching"],
+    "problem":      ["stress overwhelmed difficulty empty searching",
+                     "tired exhausted struggle inconvenience"],
+    "product":      ["product delivery package fresh groceries arrival",
+                     "phone app order confirmation unboxing"],
+    "benefits":     ["happy satisfied family smile success lifestyle",
+                     "comfortable convenient easy home relief"],
+    "social_proof": ["customer happy satisfied testimonial review",
+                     "positive results achievement people smiling"],
+    "cta":          ["phone ordering online shopping app tap button",
+                     "call to action download install click purchase"],
 }
 SCENE_ORDER = ["hook", "problem", "product", "benefits", "social_proof", "cta"]
 _used_ids: set = set()
 
 
-# ── SSML-style pacing for edge-tts ───────────────────────────────────────────
+# ── SSML-style pacing ────────────────────────────────────────────────────────
 def pace_narration(text: str) -> str:
-    """Insert natural pauses for better edge-tts pacing."""
-    # Sentence boundaries → longer pause (3 spaces for edge-tts)
     t = re.sub(r"([.!?])\s+", r"\1   ", text.strip())
-    # Comma pauses
     t = re.sub(r",\s+", r",  ", t)
-    # Remove multiple spaces from source but keep our intentional ones
     t = re.sub(r"[ \t]{4,}", "   ", t)
     return t
 
 
-# ── Plan normaliser → exactly 6 scenes × SCENE_DUR ───────────────────────────
+# ── Plan normaliser → exactly 6 scenes ───────────────────────────────────────
 def normalize_plan(plan: dict) -> dict:
     scenes    = list(plan.get("scenes") or [])
     narration = list(plan.get("narration") or [])
@@ -78,20 +94,17 @@ def normalize_plan(plan: dict) -> dict:
         })
     scenes = scenes[:N_SCENES]
 
-    for i, s in enumerate(scenes):
-        s["duration_s"] = SCENE_DUR
-        if "scene_type" not in s:
-            s["scene_type"] = SCENE_ORDER[i % N_SCENES]
-
-    # Distribute narration text across scenes
     full_text  = " ".join(n.get("text", "") for n in narration)
     words      = full_text.split()
     words_per  = max(1, len(words) // N_SCENES)
     for i, s in enumerate(scenes):
-        chunk = words[i * words_per: (i + 1) * words_per]
+        s["duration_s"] = SCENE_DUR
+        if "scene_type" not in s:
+            s["scene_type"] = SCENE_ORDER[i % N_SCENES]
         if i < len(narration) and narration[i].get("text"):
             s["_caption"] = narration[i]["text"]
         else:
+            chunk = words[i * words_per: (i + 1) * words_per]
             s["_caption"] = " ".join(chunk)
 
     plan["scenes"]     = scenes
@@ -100,11 +113,92 @@ def normalize_plan(plan: dict) -> dict:
 
 
 # ── TTS ───────────────────────────────────────────────────────────────────────
-async def generate_tts(text: str, voice: str, out_path: str):
+async def generate_tts(text: str, voice: str, out_path: str) -> None:
     await edge_tts.Communicate(text, voice).save(out_path)
 
 
-# ── Pexels clip fetch ─────────────────────────────────────────────────────────
+# ── Mode B: build one scene from N AI micro-shots ─────────────────────────────
+async def build_micro_scene(
+    scene_idx: int, scene: dict, tmp: Path, headlines: list
+) -> str:
+    """
+    Generate MICRO_PER_SCENE (8) AI images for a scene, animate each with
+    Ken Burns (1.29s each), stitch with hard cuts → 10.33s scene MP4.
+    This is the Mode B TikTok-energy engine.
+    """
+    stype   = scene.get("scene_type", SCENE_ORDER[scene_idx % N_SCENES])
+    kws_raw = scene.get("search_keywords") or random.choice(
+        SCENE_KWMAP.get(stype, [["lifestyle"]])
+    ).split()
+    visual  = scene.get("visual_description", "")
+
+    # Fetch all N micro-shot images concurrently
+    imgs = await fetch_micro_shots(
+        scene_type=stype,
+        keywords=kws_raw,
+        visual_description=visual,
+        tmp=tmp,
+        scene_idx=scene_idx,
+        n_shots=MICRO_PER_SCENE,
+    )
+
+    shot_paths: list[str] = []
+    for shot_idx, img in enumerate(imgs):
+        shot_out = str(tmp / f"shot_{scene_idx}_{shot_idx}.mp4")
+        motion   = MICRO_MOTIONS[shot_idx % len(MICRO_MOTIONS)]
+
+        if img and img.exists():
+            try:
+                make_micro_shot(str(img), shot_out,
+                                motion=motion, duration=MICRO_DUR)
+                shot_paths.append(shot_out)
+                continue
+            except Exception:
+                pass
+
+        # Fallback for failed images: color card micro-shot
+        stype_colors = {
+            "hook": "#0d0020", "problem": "#1a0000", "product": "#00101e",
+            "benefits": "#001a0a", "social_proof": "#0e0e00", "cta": "#1a0010",
+        }
+        clr = stype_colors.get(stype, "#0a0a14")
+        make_color_card(clr, MICRO_DUR, shot_out,
+                        text=headlines[scene_idx] if shot_idx == 0 else None)
+        shot_paths.append(shot_out)
+
+    # Stitch 8 micro-shots → one 10.33s scene
+    scene_out = str(tmp / f"scene_{scene_idx}.mp4")
+    stitch_micro_shots(shot_paths, scene_out)
+    return scene_out
+
+
+# ── Mode A: Modal CogVideoX clip ─────────────────────────────────────────────
+async def generate_ai_scene(
+    client: httpx.AsyncClient, prompt: str, scene_idx: int, duration: float, out: Path
+) -> Optional[Path]:
+    """
+    Call Modal CogVideoX endpoint for true AI-generated video clip.
+    Requires MODAL_ENDPOINT env var. Railway CPU CANNOT run this locally.
+    VRAM required: CogVideoX-2B = 14GB, CogVideoX1.5-5B = 24GB.
+    """
+    if not MODAL_EP:
+        return None
+    try:
+        r = await client.post(
+            f"{MODAL_EP}/generate",
+            json={"prompt": prompt, "duration_s": min(duration, 10),
+                  "seed": 42 + scene_idx},
+            timeout=300,
+        )
+        r.raise_for_status()
+        out.write_bytes(r.content)
+        return out if out.exists() else None
+    except Exception as e:
+        print(f"[Mode A] Modal call failed scene {scene_idx}: {e}")
+        return None
+
+
+# ── Pexels ────────────────────────────────────────────────────────────────────
 async def fetch_pexels(
     client: httpx.AsyncClient, keywords: list, duration_s: float, out: Path
 ) -> Optional[Path]:
@@ -134,37 +228,17 @@ async def fetch_pexels(
         return None
 
 
-# ── Modal AI scene generation (Mode A) ───────────────────────────────────────
-async def generate_ai_scene(
-    client: httpx.AsyncClient, prompt: str, scene_idx: int, duration: float, out: Path
-) -> Optional[Path]:
-    if not MODAL_EP:
-        return None
-    try:
-        r = await client.post(
-            f"{MODAL_EP}/generate",
-            json={"prompt": prompt, "duration_s": min(duration, 10),
-                  "seed": 42 + scene_idx},
-            timeout=300,
-        )
-        r.raise_for_status()
-        out.write_bytes(r.content)
-        return out
-    except Exception:
-        return None
-
-
-# ── Background music download ─────────────────────────────────────────────────
+# ── Background music ──────────────────────────────────────────────────────────
 async def fetch_music(tmp: Path) -> Optional[str]:
     if not MUSIC_URL:
         return None
-    music_out = tmp / "music.mp3"
+    out = tmp / "music.mp3"
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
-            r = await client.get(MUSIC_URL)
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.get(MUSIC_URL)
             r.raise_for_status()
-            music_out.write_bytes(r.content)
-            return str(music_out)
+            out.write_bytes(r.content)
+            return str(out)
     except Exception:
         return None
 
@@ -178,12 +252,15 @@ async def upload_cloudinary(file_path: str, resource_type: str = "video") -> str
     signature = hashlib.sha1(
         f"folder={folder}&timestamp={ts}{CLOUDINARY_SECRET}".encode()
     ).hexdigest()
-    url       = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
-    fsize     = os.path.getsize(file_path)
-    chunk_sz  = 20 * 1024 * 1024
+    url = f"https://api.cloudinary.com/v1_1/{CLOUDINARY_CLOUD}/{resource_type}/upload"
+    fsize    = os.path.getsize(file_path)
+    chunk_sz = 20 * 1024 * 1024
     async with httpx.AsyncClient(timeout=300) as client:
         if fsize > 50 * 1024 * 1024:
-            uid, pub_id, secure, offset = uuid.uuid4().hex, f"adreel/{uuid.uuid4().hex}", None, 0
+            uid = uuid.uuid4().hex
+            pub_id = f"adreel/{uuid.uuid4().hex}"
+            secure = None
+            offset = 0
             with open(file_path, "rb") as f:
                 while True:
                     chunk = f.read(chunk_sz)
@@ -192,7 +269,8 @@ async def upload_cloudinary(file_path: str, resource_type: str = "video") -> str
                     end  = offset + len(chunk) - 1
                     resp = await client.post(url,
                         data={"api_key": CLOUDINARY_KEY, "timestamp": str(ts),
-                              "folder": folder, "signature": signature, "public_id": pub_id},
+                              "folder": folder, "signature": signature,
+                              "public_id": pub_id},
                         files={"file": (os.path.basename(file_path), chunk)},
                         headers={"X-Unique-Upload-Id": uid,
                                  "Content-Range": f"bytes {offset}-{end}/{fsize}"},
@@ -214,23 +292,23 @@ async def upload_cloudinary(file_path: str, resource_type: str = "video") -> str
 
 
 # ── Main render orchestrator ──────────────────────────────────────────────────
-async def run_render(job_id: str, plan: dict, upd: Callable):
+async def run_render(job_id: str, plan: dict, upd: Callable) -> None:
     import tempfile
 
     def u(status: str, pct: int, **kw):
         upd(job_id, status=status, progress=pct, **kw)
 
     with tempfile.TemporaryDirectory() as tmp_str:
-        tmp = Path(tmp_str)
-        _used_ids.clear()
+        tmp  = Path(tmp_str)
         mode = plan.get("render_mode", RENDER_MODE)
+        _used_ids.clear()
 
         try:
-            # 0 — Normalize plan
+            # Step 0 — Normalize plan to exactly 6 scenes × SCENE_DUR
             plan   = normalize_plan(plan)
             scenes = plan["scenes"]
 
-            # 1 — TTS with sentence pacing
+            # Step 1 — TTS with sentence pacing + EBU R128
             u("GENERATING_AUDIO", 5)
             narr_text = (
                 plan.get("voiceover_script", "").strip()
@@ -239,102 +317,99 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
                 or "Discover something amazing today."
             )
             paced_text = pace_narration(narr_text)
-            voice      = VOICE_MAP.get(plan.get("voice_style", "professional_female"),
-                                       "en-US-JennyNeural")
+            voice      = VOICE_MAP.get(
+                plan.get("voice_style", "professional_female"), "en-US-JennyNeural"
+            )
             raw_audio  = tmp / "voice_raw.mp3"
             norm_audio = tmp / "voice.mp3"
             await asyncio.wait_for(
                 generate_tts(paced_text, voice, str(raw_audio)), timeout=90
             )
-            # EBU R128 loudness normalisation
             try:
                 normalize_loudness(str(raw_audio), str(norm_audio))
             except Exception:
-                import shutil as _sh
-                _sh.copy(str(raw_audio), str(norm_audio))
+                import shutil
+                shutil.copy(str(raw_audio), str(norm_audio))
 
-            # 2 — Build scene visuals
+            # Step 2 — Build scene visuals
             u("FETCHING_ASSETS", 15)
+            words     = narr_text.split()
+            wps       = max(1, len(words) // N_SCENES)
+            headlines = [" ".join(words[i*wps:(i+1)*wps])[:55] for i in range(N_SCENES)]
             clips: list[str] = []
-            words      = narr_text.split()
-            wps        = max(1, len(words) // N_SCENES)
-            headlines  = [" ".join(words[i*wps:(i+1)*wps])[:55] for i in range(N_SCENES)]
 
-            async with httpx.AsyncClient(timeout=30) as client:
-                for i, scene in enumerate(scenes):
-                    stype = scene.get("scene_type", SCENE_ORDER[i % N_SCENES])
-                    kws   = (
-                        scene.get("search_keywords")
-                        or random.choice(SCENE_KWMAP.get(stype, [["lifestyle"]])).split()
-                    )
-                    raw  = tmp / f"raw_{i}.mp4"
-                    proc = str(tmp / f"proc_{i}.mp4")
+            for i, scene in enumerate(scenes):
+                stype = scene.get("scene_type", SCENE_ORDER[i % N_SCENES])
+                raw   = tmp / f"raw_{i}.mp4"
+                proc  = str(tmp / f"proc_{i}.mp4")
+                pct   = 15 + i * 6
 
-                    # Mode A: AI generation via Modal
-                    if mode == "ai" and MODAL_EP:
-                        prompt = scene.get("visual_description", " ".join(kws))
-                        clip   = await generate_ai_scene(client, prompt, i, SCENE_DUR, raw)
-                        if clip and clip.exists():
+                # ── Mode A: GPU text-to-video via Modal ────────────────────
+                if mode == "ai" and MODAL_EP:
+                    prompt = scene.get("visual_description", " ".join(
+                        scene.get("search_keywords", [stype])[:3]
+                    ))
+                    async with httpx.AsyncClient(timeout=5) as c:
+                        clip = await generate_ai_scene(c, prompt, i, SCENE_DUR, raw)
+                    if clip and clip.exists():
+                        trim_and_grade(str(clip), SCENE_DUR, proc, motion_idx=i)
+                        clips.append(proc)
+                        u("FETCHING_ASSETS", pct)
+                        continue
+
+                # ── Mode stock: single Pexels clip per scene ───────────────
+                if mode == "stock" and PEXELS_KEY:
+                    kws = (scene.get("search_keywords")
+                           or random.choice(
+                               SCENE_KWMAP.get(stype, [["lifestyle"]])
+                           ).split())
+                    async with httpx.AsyncClient(timeout=30) as c:
+                        clip = await fetch_pexels(c, kws, SCENE_DUR, raw)
+                    if clip and clip.exists():
+                        try:
                             trim_and_grade(str(clip), SCENE_DUR, proc, motion_idx=i)
                             clips.append(proc)
-                            u("FETCHING_ASSETS", 15 + i * 5)
-                            continue
-
-                    # Try Pexels stock footage first
-                    if PEXELS_KEY:
-                        clip = await fetch_pexels(client, kws, SCENE_DUR, raw)
-                        if clip and clip.exists():
-                            try:
-                                trim_and_grade(str(clip), SCENE_DUR, proc, motion_idx=i)
-                                clips.append(proc)
-                                u("FETCHING_ASSETS", 15 + i * 5)
-                                continue
-                            except Exception:
-                                pass
-
-                    # Fallback 1: AI-generated image via Pollinations.ai (free, no GPU)
-                    img_prompt  = build_img_prompt(
-                        stype, kws,
-                        scene.get("visual_description", ""),
-                    )
-                    img_path    = tmp / f"ai_img_{i}.jpg"
-                    MOTIONS     = ["zoom_in", "zoom_out", "pan_right", "zoom_in", "zoom_out", "pan_left"]
-                    ai_img      = await fetch_ai_image(img_prompt, img_path, seed=42 + i)
-                    if ai_img and ai_img.exists():
-                        try:
-                            image_to_video(str(ai_img), SCENE_DUR, proc,
-                                           motion=MOTIONS[i % len(MOTIONS)])
-                            clips.append(proc)
-                            u("FETCHING_ASSETS", 15 + i * 5)
+                            u("FETCHING_ASSETS", pct)
                             continue
                         except Exception:
                             pass
 
-                    # Fallback 2: motion-graphic template
-                    mg = make_scene(
-                        tmp, i, stype, SCENE_DUR,
-                        headline=headlines[i] if i < len(headlines) else "",
-                        subline=stype.replace("_", " ").title(),
-                    )
-                    clips.append(mg)
-                    u("FETCHING_ASSETS", 15 + i * 5)
+                # ── Mode motion (default): 8 AI micro-shots per scene ──────
+                try:
+                    scene_mp4 = await build_micro_scene(i, scene, tmp, headlines)
+                    clips.append(scene_mp4)
+                    u("FETCHING_ASSETS", pct)
+                    continue
+                except Exception as e:
+                    print(f"[Mode B] micro-scene {i} failed: {e}")
 
-            # 3 — Compose with xfade → exactly 60s
-            u("COMPOSITING", 50)
+                # ── Last resort: plain color card ──────────────────────────
+                fallback_colors = {
+                    "hook": "#0d0020", "problem": "#1a0000", "product": "#00101e",
+                    "benefits": "#001a0a", "social_proof": "#0e0e00", "cta": "#1a0010",
+                }
+                clr = fallback_colors.get(stype, "#0a0a14")
+                make_color_card(clr, SCENE_DUR, proc,
+                                text=headlines[i] if i < len(headlines) else None)
+                clips.append(proc)
+                u("FETCHING_ASSETS", pct)
+
+            # Step 3 — Compose 6 scenes with xfade → exactly 60.0s
+            u("COMPOSITING", 55)
             composed = tmp / "composed.mp4"
             compose_xfade(clips, str(composed))
 
-            # 4 — Music bed (optional)
+            # Step 4 — Optional music bed
             u("COMPOSITING", 60)
             music_path = await fetch_music(tmp)
 
-            # 5 — Mix audio (voice + music, pad to 60s)
+            # Step 5 — Mix voice + music, pad to video duration
             u("COMPOSITING", 65)
             with_audio = tmp / "with_audio.mp4"
             mix_audio(str(composed), str(norm_audio), str(with_audio),
                       music_path=music_path, music_vol=0.10)
 
-            # 6 — Generate ASS karaoke captions
+            # Step 6 — Generate word-level ASS karaoke captions (Whisper)
             u("COMPOSITING", 78)
             vid_dur  = get_duration(str(with_audio))
             ass_path = str(tmp / "captions.ass")
@@ -347,18 +422,17 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
                 from captions import estimate_words, build_ass
                 build_ass(estimate_words(narr_text, vid_dur), ass_path)
 
-            # 7 — Burn captions
+            # Step 7 — Burn ASS karaoke captions
             u("COMPOSITING", 85)
             final = tmp / "final.mp4"
             try:
                 burn_ass_captions(str(with_audio), ass_path, str(final))
             except Exception:
-                # ASS burn failed → fallback to drawtext
                 captions = build_word_captions(narr_text, vid_dur)
                 burn_captions(str(with_audio), captions,
                               plan.get("caption_style", "bold"), str(final))
 
-            # 8 — Upload
+            # Step 8 — Upload to Cloudinary
             u("UPLOADING", 92)
             video_url = await upload_cloudinary(str(final), "video")
             thumb     = tmp / "thumb.jpg"
@@ -367,12 +441,14 @@ async def run_render(job_id: str, plan: dict, upd: Callable):
 
             dur  = get_duration(str(final))
             size = os.path.getsize(str(final))
-            u("DONE", 100, video_url=video_url, thumbnail_url=thumb_url,
+            u("DONE", 100,
+              video_url=video_url, thumbnail_url=thumb_url,
               duration_s=round(dur, 1), file_size_bytes=size,
-              render_mode=mode, whisper_used=_WHISPER_AVAILABLE)
+              render_mode=mode, whisper_used=_WHISPER_AVAILABLE,
+              micro_shots=(mode not in ("stock", "ai")))
 
         except asyncio.TimeoutError:
-            u("FAILED", 0, error="TTS timed out")
+            u("FAILED", 0, error="TTS timed out after 90s")
         except Exception as e:
             u("FAILED", 0, error=str(e))
             raise
