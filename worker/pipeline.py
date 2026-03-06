@@ -1,14 +1,18 @@
 """
-AdReel render pipeline v5
+AdReel render pipeline v7
 ─────────────────────────────────────────────────────────────────────────────
 RENDER_MODE env var:
   motion  (default) — Mode B: 8 AI micro-shots per scene, Ken Burns, hard cuts
   stock              — Mode B with Pexels clips (one per scene)
-  ai                 — Mode A: GPU text-to-video via Modal CogVideoX endpoint
+  ai                 — Mode A: GPU text-to-video via Modal Wan2.1 endpoint
 
-⚠️  Railway CPU CANNOT run CogVideoX/Wan2.1/LTX-Video.
-    Those models require 8–24 GB VRAM. Mode A needs MODAL_ENDPOINT set.
-    Mode B on CPU is the free, shippable path.
+MODEL: Wan2.1-T2V (replaces CogVideoX-2B)
+  WAN_QUALITY=best → 14B model on A100-40GB (~$0.72–1.20/video, best quality)
+  WAN_QUALITY=fast → 1.3B model on A10G  (~$0.21/video, faster)
+
+⚠️  Railway CPU CANNOT run Wan2.1.
+    Mode A needs MODAL_ENDPOINT set (deploy modal_worker.py first).
+    Mode B on CPU is the free $0 path.
 
 60s formula: SCENE_DUR = (60 + 5×0.4) / 6 = 10.3333s
              per micro-shot = 10.3333 / 8 = 1.2917s
@@ -221,29 +225,48 @@ async def build_micro_scene(
     return scene_out
 
 
-# ── Mode A: Modal CogVideoX clip ─────────────────────────────────────────────
+# ── Mode A: Modal Wan2.1 clip ─────────────────────────────────────────────────
 async def generate_ai_scene(
     client: httpx.AsyncClient, prompt: str, scene_idx: int, duration: float, out: Path
 ) -> Optional[Path]:
     """
-    Call Modal CogVideoX endpoint for true AI-generated video clip.
-    Requires MODAL_ENDPOINT env var. Railway CPU CANNOT run this locally.
-    VRAM required: CogVideoX-2B = 14GB, CogVideoX1.5-5B = 24GB.
+    Call Modal Wan2.1-T2V endpoint for AI-generated video clip.
+    Requires MODAL_ENDPOINT env var pointing to deployed modal_worker.py.
+    VRAM required: Wan2.1-14B = A100-40GB | Wan2.1-1.3B = A10G
+    Set WAN_QUALITY=fast in Railway env for 1.3B (cheaper), else 14B.
     """
     if not MODAL_EP:
         return None
+
+    wan_quality = os.environ.get("WAN_QUALITY", "best")  # "fast"=1.3B, "best"=14B
+    # Wan2.1 outputs 81 frames @ 16fps ≈ 5.06s; we request vertical 9:16
+    payload = {
+        "prompt": prompt,
+        "negative_prompt": (
+            "blurry, low quality, distorted faces, watermark, text overlay, "
+            "overexposed, underexposed, ugly, deformed, low resolution"
+        ),
+        "width": 480,           # 9:16 vertical for TikTok/Reels
+        "height": 832,
+        "num_frames": 81,       # max supported by Wan2.1
+        "guidance_scale": 5.0,
+        "num_inference_steps": 30 if wan_quality == "best" else 25,
+        "seed": 42 + scene_idx,
+        "quality": wan_quality,
+    }
     try:
+        print(f"[Wan2.1] Requesting scene {scene_idx} quality={wan_quality}...")
         r = await client.post(
-            f"{MODAL_EP}/generate",
-            json={"prompt": prompt, "duration_s": min(duration, 10),
-                  "seed": 42 + scene_idx},
-            timeout=300,
+            f"{MODAL_EP}/generate_clip",
+            json=payload,
+            timeout=600,        # Wan2.1-14B can take up to 5 min on A100
         )
         r.raise_for_status()
         out.write_bytes(r.content)
+        print(f"[Wan2.1] Scene {scene_idx} done — {len(r.content):,} bytes")
         return out if out.exists() else None
     except Exception as e:
-        print(f"[Mode A] Modal call failed scene {scene_idx}: {e}")
+        print(f"[Wan2.1] Modal call failed scene {scene_idx}: {e}")
         return None
 
 
