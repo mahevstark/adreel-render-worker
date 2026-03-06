@@ -37,6 +37,7 @@ from ai_images import (
     fetch_ai_image, fetch_micro_shots, image_to_video,
     build_prompt as build_img_prompt, extract_anchor,
 )
+from wan_client import generate_wan
 
 # ── Config ────────────────────────────────────────────────────────────────────
 RENDER_MODE  = os.environ.get("RENDER_MODE", "motion")   # motion|stock|ai
@@ -235,39 +236,16 @@ async def generate_ai_scene(
     VRAM required: Wan2.1-14B = A100-40GB | Wan2.1-1.3B = A10G
     Set WAN_QUALITY=fast in Railway env for 1.3B (cheaper), else 14B.
     """
-    if not MODAL_EP:
-        return None
-
-    wan_quality = os.environ.get("WAN_QUALITY", "best")  # "fast"=1.3B, "best"=14B
-    # Wan2.1 outputs 81 frames @ 16fps ≈ 5.06s; we request vertical 9:16
-    payload = {
-        "prompt": prompt,
-        "negative_prompt": (
-            "blurry, low quality, distorted faces, watermark, text overlay, "
-            "overexposed, underexposed, ugly, deformed, low resolution"
-        ),
-        "width": 480,           # 9:16 vertical for TikTok/Reels
-        "height": 832,
-        "num_frames": 81,       # max supported by Wan2.1
-        "guidance_scale": 5.0,
-        "num_inference_steps": 30 if wan_quality == "best" else 25,
-        "seed": 42 + scene_idx,
-        "quality": wan_quality,
-    }
-    try:
-        print(f"[Wan2.1] Requesting scene {scene_idx} quality={wan_quality}...")
-        r = await client.post(
-            f"{MODAL_EP}/generate_clip",
-            json=payload,
-            timeout=600,        # Wan2.1-14B can take up to 5 min on A100
-        )
-        r.raise_for_status()
-        out.write_bytes(r.content)
-        print(f"[Wan2.1] Scene {scene_idx} done — {len(r.content):,} bytes")
-        return out if out.exists() else None
-    except Exception as e:
-        print(f"[Wan2.1] Modal call failed scene {scene_idx}: {e}")
-        return None
+    # Delegate to wan_client — auto-selects HF Space (free) or Modal (paid)
+    # WAN_BACKEND=hf_space → FREE (uses Wan-AI's own HF Space GPU)
+    # WAN_BACKEND=modal    → Paid Modal endpoint (better uptime/SLA)
+    return await generate_wan(
+        prompt=prompt,
+        scene_idx=scene_idx,
+        duration=duration,
+        modal_endpoint=MODAL_EP,
+        out_path=out,
+    )
 
 
 # ── Pexels ────────────────────────────────────────────────────────────────────
