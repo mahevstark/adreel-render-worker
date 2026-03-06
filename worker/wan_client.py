@@ -1,29 +1,14 @@
 """
 wan_client.py — Free Wan2.1 via HuggingFace Spaces Gradio API
 ──────────────────────────────────────────────────────────────────────────────
-Uses the official Wan-AI/Wan2.1 HuggingFace Space as a FREE GPU backend.
-No Modal account, no API key, no cost — Wan-AI pays for the GPU.
+Calls the official Wan-AI/Wan2.1 HuggingFace Space as a FREE GPU backend.
+No Modal, no API key, no cost — Wan-AI runs the GPU.
 
-HOW IT WORKS:
-  1. gradio_client connects to huggingface.co/spaces/Wan-AI/Wan2.1
-  2. Submits a text-to-video job to their Gradio queue
-  3. Waits for result (can take 30s–5min depending on queue)
-  4. Downloads the MP4 bytes
-  5. Returns them to pipeline.py exactly like Modal did
-
-LIMITATIONS (free tier trade-offs):
-  - Queue wait times: 30s–10min during peak hours
-  - Rate limits: HF may throttle heavy usage
-  - No SLA: Space could go down or be paused
-  - Output resolution: 480p (Space default)
-  - Max ~5s clips (81 frames)
-
-SET IN RAILWAY ENV:
-  RENDER_MODE=ai
-  WAN_BACKEND=hf_space    ← uses this free HF Space client
-  WAN_BACKEND=modal       ← uses paid Modal endpoint (better uptime)
-
-If WAN_BACKEND is not set, defaults to hf_space (free).
+SET IN RAILWAY:
+  RENDER_MODE=ai           ← activates Mode A
+  WAN_BACKEND=hf_space     ← default, free via HF Space
+  WAN_BACKEND=modal        ← paid Modal endpoint
+  HF_TOKEN=hf_xxx          ← optional, increases rate limits
 """
 
 import asyncio
@@ -32,95 +17,141 @@ import tempfile
 from pathlib import Path
 from typing import Optional
 
-# HF token is optional — public spaces work without it
-# Set HF_TOKEN env var for higher rate limits
 HF_TOKEN = os.environ.get("HF_TOKEN", None)
 HF_SPACE  = "Wan-AI/Wan2.1"
 
 
+# ── HuggingFace Space (free) ──────────────────────────────────────────────────
 async def generate_wan_hf(
     prompt: str,
     negative_prompt: str = "blurry, low quality, distorted, watermark, text",
-    width: int = 832,
-    height: int = 480,
-    num_frames: int = 81,
+    num_inference_steps: int = 20,
     guidance_scale: float = 5.0,
-    num_inference_steps: int = 30,
     seed: int = 42,
     timeout: int = 600,
 ) -> Optional[bytes]:
-    """
-    Call the Wan-AI/Wan2.1 HuggingFace Space via gradio_client.
-    Returns raw MP4 bytes or None on failure.
-
-    Runs in a thread pool to avoid blocking the async event loop.
-    """
+    """Call Wan-AI/Wan2.1 HF Space via gradio_client. Returns MP4 bytes or None."""
     loop = asyncio.get_event_loop()
     return await loop.run_in_executor(
         None,
         _generate_sync,
-        prompt, negative_prompt, width, height,
-        num_frames, guidance_scale, num_inference_steps, seed, timeout,
+        prompt, negative_prompt, num_inference_steps, guidance_scale, seed, timeout,
     )
 
 
 def _generate_sync(
     prompt: str,
     negative_prompt: str,
-    width: int,
-    height: int,
-    num_frames: int,
-    guidance_scale: float,
     num_inference_steps: int,
+    guidance_scale: float,
     seed: int,
     timeout: int,
 ) -> Optional[bytes]:
-    """Synchronous Gradio client call (runs in thread pool)."""
+    """Synchronous Gradio client call — runs in executor thread."""
     try:
-        from gradio_client import Client, handle_file
+        from gradio_client import Client
     except ImportError:
-        print("[WanHF] gradio_client not installed. Run: pip install gradio_client")
+        print("[WanHF] ERROR: gradio_client not installed. pip install gradio_client")
         return None
 
     try:
-        print(f"[WanHF] Connecting to {HF_SPACE} ...")
-        client = Client(
-            HF_SPACE,
-            hf_token=HF_TOKEN,
-        )
+        print(f"[WanHF] Connecting to HF Space: {HF_SPACE} ...")
+        client = Client(HF_SPACE, hf_token=HF_TOKEN)
 
-        print(f"[WanHF] Submitting job: {prompt[:60]}...")
-        # The Wan2.1 Space exposes a /generate endpoint
-        # Parameters match the Gradio interface
-        result = client.predict(
-            prompt=prompt,
-            negative_prompt=negative_prompt,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            seed=seed,
-            api_name="/generate",
-        )
+        # Discover available endpoints — log them so we can debug
+        try:
+            api_info = client.view_api(return_format="dict")
+            endpoints = list(api_info.get("named_endpoints", {}).keys())
+            print(f"[WanHF] Available endpoints: {endpoints}")
+        except Exception as e:
+            print(f"[WanHF] Could not inspect API: {e}")
+            endpoints = []
 
-        # Result is a filepath to the generated video on HF servers
-        if isinstance(result, str) and result.endswith(".mp4"):
-            video_path = Path(result)
-            if video_path.exists():
-                data = video_path.read_bytes()
-                print(f"[WanHF] Generated {len(data):,} bytes ✓")
-                return data
-        elif isinstance(result, dict) and "video" in result:
-            video_path = Path(result["video"])
-            if video_path.exists():
-                return video_path.read_bytes()
+        # Try known endpoint names in priority order
+        # Wan2.1 Space T2V tab is typically the first or named /generate
+        candidate_endpoints = [
+            "/generate",
+            "/generate_video",
+            "/t2v",
+            "/text_to_video",
+            "/predict",
+            "/run",
+        ]
+        # Prepend any discovered endpoints
+        for ep in endpoints:
+            if ep not in candidate_endpoints:
+                candidate_endpoints.insert(0, ep)
 
-        print(f"[WanHF] Unexpected result type: {type(result)} — {str(result)[:200]}")
+        result = None
+        last_error = None
+
+        for ep in candidate_endpoints:
+            try:
+                print(f"[WanHF] Trying endpoint: {ep} ...")
+                # Minimal call — just prompt + seed, let Space use its defaults
+                result = client.predict(
+                    prompt,
+                    api_name=ep,
+                )
+                print(f"[WanHF] Endpoint {ep} succeeded → result type: {type(result)}")
+                break
+            except Exception as e:
+                last_error = e
+                err_str = str(e)
+                if "not found" in err_str.lower() or "invalid" in err_str.lower():
+                    print(f"[WanHF] {ep} not found, trying next...")
+                    continue
+                else:
+                    # Real error (auth, timeout etc) — log and stop
+                    print(f"[WanHF] {ep} error: {e}")
+                    break
+
+        if result is None:
+            print(f"[WanHF] All endpoints failed. Last error: {last_error}")
+            return None
+
+        # Extract video file path from result
+        video_path = _extract_video_path(result)
+        if video_path and video_path.exists():
+            data = video_path.read_bytes()
+            print(f"[WanHF] Video ready: {len(data):,} bytes ✓")
+            return data
+
+        print(f"[WanHF] No video file found in result: {repr(result)[:300]}")
         return None
 
     except Exception as e:
-        print(f"[WanHF] Error: {e}")
+        print(f"[WanHF] Fatal error: {e}")
         return None
 
 
+def _extract_video_path(result) -> Optional[Path]:
+    """Extract video Path from various result shapes Gradio can return."""
+    # String path
+    if isinstance(result, str):
+        p = Path(result)
+        if p.exists() and p.suffix in (".mp4", ".webm", ".mov"):
+            return p
+
+    # Tuple/list — video usually first or last element
+    if isinstance(result, (tuple, list)):
+        for item in result:
+            p = _extract_video_path(item)
+            if p:
+                return p
+
+    # Dict with 'video' or 'path' key
+    if isinstance(result, dict):
+        for key in ("video", "path", "output", "file", "url"):
+            if key in result:
+                p = _extract_video_path(result[key])
+                if p:
+                    return p
+
+    return None
+
+
+# ── Modal endpoint (paid, better uptime) ─────────────────────────────────────
 async def generate_wan_modal(
     prompt: str,
     negative_prompt: str = "blurry, low quality, distorted, watermark, text",
@@ -134,7 +165,7 @@ async def generate_wan_modal(
     modal_endpoint: str = "",
     timeout: int = 600,
 ) -> Optional[bytes]:
-    """Call the deployed Modal Wan2.1 endpoint (paid, better uptime)."""
+    """Call the deployed Modal Wan2.1 endpoint."""
     import httpx
     if not modal_endpoint:
         return None
@@ -161,6 +192,7 @@ async def generate_wan_modal(
         return None
 
 
+# ── Unified entry point ───────────────────────────────────────────────────────
 async def generate_wan(
     prompt: str,
     scene_idx: int = 0,
@@ -169,53 +201,48 @@ async def generate_wan(
     out_path: Optional[Path] = None,
 ) -> Optional[Path]:
     """
-    Unified entry point — tries HF Space first (free), falls back to Modal.
-    Called from pipeline.py instead of the old generate_ai_scene().
-
-    WAN_BACKEND env var:
-      hf_space (default) — free HuggingFace Space
-      modal              — paid Modal endpoint
+    Route to correct backend based on WAN_BACKEND env var.
+    WAN_BACKEND=hf_space (default) → free via Wan-AI HF Space
+    WAN_BACKEND=modal              → paid Modal endpoint
     """
     backend = os.environ.get("WAN_BACKEND", "hf_space")
     seed    = 42 + scene_idx
-    quality = os.environ.get("WAN_QUALITY", "best")
 
     negative = (
         "blurry, low quality, distorted faces, watermark, text overlay, "
         "overexposed, ugly, deformed, low resolution, duplicate objects"
     )
 
-    video_bytes = None
+    video_bytes: Optional[bytes] = None
 
     if backend == "modal" and modal_endpoint:
-        print(f"[Wan] Backend: Modal ({quality})")
+        print(f"[Wan] Using Modal backend (quality={os.environ.get('WAN_QUALITY','best')})")
         video_bytes = await generate_wan_modal(
             prompt=prompt,
             negative_prompt=negative,
-            width=480, height=832,  # 9:16 vertical
+            width=480, height=832,
             num_frames=81,
             seed=seed,
-            quality=quality,
+            quality=os.environ.get("WAN_QUALITY", "best"),
             modal_endpoint=modal_endpoint,
         )
     else:
-        print(f"[Wan] Backend: HF Space (free)")
+        print(f"[Wan] Using FREE HF Space backend (Wan-AI/Wan2.1)")
         video_bytes = await generate_wan_hf(
             prompt=prompt,
             negative_prompt=negative,
-            width=832, height=480,  # HF Space default (landscape)
-            num_frames=81,
+            num_inference_steps=20,
+            guidance_scale=5.0,
             seed=seed,
         )
 
     if not video_bytes:
-        print(f"[Wan] Generation failed for scene {scene_idx}")
+        print(f"[Wan] Generation failed — scene {scene_idx} will use Mode B fallback")
         return None
 
     if out_path is None:
-        tmp = tempfile.mktemp(suffix=".mp4")
-        out_path = Path(tmp)
+        out_path = Path(tempfile.mktemp(suffix=".mp4"))
 
     out_path.write_bytes(video_bytes)
-    print(f"[Wan] Saved scene {scene_idx} → {out_path} ({len(video_bytes):,} bytes)")
+    print(f"[Wan] Scene {scene_idx} saved → {out_path} ({len(video_bytes):,} bytes)")
     return out_path
