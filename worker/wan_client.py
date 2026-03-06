@@ -56,7 +56,11 @@ def _generate_sync(
 
     try:
         print(f"[WanHF] Connecting to HF Space: {HF_SPACE} ...")
-        client = Client(HF_SPACE, hf_token=HF_TOKEN)
+        # gradio_client <0.7 uses token=, >=0.7 uses hf_token=
+        try:
+            client = Client(HF_SPACE, hf_token=HF_TOKEN)
+        except TypeError:
+            client = Client(HF_SPACE, token=HF_TOKEN)
 
         # Discover available endpoints — log them so we can debug
         try:
