@@ -228,7 +228,7 @@ async def build_micro_scene(
 
 # ── Mode A: Modal Wan2.1 clip ─────────────────────────────────────────────────
 async def generate_ai_scene(
-    client: httpx.AsyncClient, prompt: str, scene_idx: int, duration: float, out: Path
+    _client, prompt: str, scene_idx: int, duration: float, out: Path
 ) -> Optional[Path]:
     """
     Call Modal Wan2.1-T2V endpoint for AI-generated video clip.
@@ -403,13 +403,15 @@ async def run_render(job_id: str, plan: dict, upd: Callable) -> None:
                 proc  = str(tmp / f"proc_{i}.mp4")
                 pct   = 15 + i * 6
 
-                # ── Mode A: GPU text-to-video via Modal ────────────────────
-                if mode == "ai" and MODAL_EP:
+                # ── Mode A: Wan2.1 (free HF Space or paid Modal) ──────────
+                # WAN_BACKEND=hf_space (default) = FREE, no MODAL_EP needed
+                # WAN_BACKEND=modal = needs MODAL_EP set
+                wan_backend = os.environ.get("WAN_BACKEND", "hf_space")
+                if mode == "ai" and (wan_backend == "hf_space" or MODAL_EP):
                     prompt = scene.get("visual_description", " ".join(
                         scene.get("search_keywords", [stype])[:3]
                     ))
-                    async with httpx.AsyncClient(timeout=5) as c:
-                        clip = await generate_ai_scene(c, prompt, i, SCENE_DUR, raw)
+                    clip = await generate_ai_scene(None, prompt, i, SCENE_DUR, raw)
                     if clip and clip.exists():
                         ai_dur = get_duration(str(clip))
                         if ai_dur >= SCENE_DUR - 0.5:
